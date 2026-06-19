@@ -1,0 +1,1 @@
+# Med_QA_Platform
