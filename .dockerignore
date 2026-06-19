@@ -1,0 +1,42 @@
+# Git
+.git/
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+
+# Large model checkpoints (mounted as volume at runtime, not needed in image)
+models/checkpoints/*
+!models/checkpoints/.gitkeep
+
+# Dataset files (mounted as volume at runtime, not needed in image)
+data/busi/*
+data/tn3k/*
+!data/busi/.gitkeep
+!data/tn3k/.gitkeep
+
+# RAG vector DB (mounted as volume at runtime, not needed in image)
+services/orchestrator/rag/vectordb/*
+!services/orchestrator/rag/vectordb/.gitkeep
+services/orchestrator/rag/docs/*
+!services/orchestrator/rag/docs/.gitkeep
+
+# Env / secrets
+.env
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Misc
+outputs/
+*.log

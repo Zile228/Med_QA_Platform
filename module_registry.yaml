@@ -1,0 +1,34 @@
+# Module Registry — mỗi entry = 1 service
+# Orchestrator đọc file này để biết gọi service nào cho modality nào
+
+version: "1.0"
+
+services:
+  router:
+    url: "http://router:8001"
+    endpoint: "/route"
+    description: "Modality classifier (EfficientNet-B0)"
+
+  vision:
+    url: "http://vision:8002"
+    modalities:
+      us_breast:
+        endpoint: "/analyze/us_breast"
+        description: "Breast US — MedSAM segment + MTL classify"
+      us_thyroid:
+        endpoint: "/analyze/us_thyroid"
+        description: "Thyroid US — MedSAM segment + TI-RADS features"
+      xray:
+        endpoint: "/analyze/xray"
+        description: "X-Ray — Phase 2 (not implemented)"
+        enabled: false
+
+  knowledge:
+    url: "http://knowledge:8003"
+    endpoint: "/map"
+    description: "Severity mapping + spatial feature derivation"
+
+  orchestrator:
+    url: "http://orchestrator:8000"
+    endpoint: "/analyze"
+    description: "LangGraph gateway — coordinates all services"

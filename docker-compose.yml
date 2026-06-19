@@ -1,0 +1,76 @@
+services:
+
+  router:
+    build:
+      context: .
+      dockerfile: services/router/Dockerfile
+    ports:
+      - "${ROUTER_PORT:-8001}:8001"
+    env_file: .env
+    volumes:
+      - ./models/checkpoints:/app/models/checkpoints:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  vision:
+    build:
+      context: .
+      dockerfile: services/vision/Dockerfile
+    ports:
+      - "${VISION_PORT:-8002}:8002"
+    env_file: .env
+    volumes:
+      - ./models/checkpoints:/app/models/checkpoints:ro
+      - ./data:/app/data:ro
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  knowledge:
+    build:
+      context: .
+      dockerfile: services/knowledge/Dockerfile
+    ports:
+      - "${KNOWLEDGE_PORT:-8003}:8003"
+    env_file: .env
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: services/orchestrator/Dockerfile
+    ports:
+      - "${ORCHESTRATOR_PORT:-8000}:8000"
+    env_file: .env
+    volumes:
+      - ./services/orchestrator/rag/docs:/app/services/orchestrator/rag/docs:ro
+      - ./services/orchestrator/rag/vectordb:/app/services/orchestrator/rag/vectordb
+      - ./module_registry.yaml:/app/module_registry.yaml:ro
+    depends_on:
+      - router
+      - vision
+      - knowledge
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ui:
+    build:
+      context: .
+      dockerfile: ui/Dockerfile
+    ports:
+      - "7860:7860"
+    env_file: .env
+    depends_on:
+      - orchestrator
