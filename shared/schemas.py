@@ -1,29 +1,29 @@
 """
 shared/schemas.py - Unified Output Schema
 ==========================================
-File quan trọng nhất của project. Mọi service đều import từ đây.
-Không sửa schema mà không báo - thay đổi ở đây ảnh hưởng toàn bộ pipeline.
+File quan trong nhat cua project. Moi service deu import tu day.
+Khong sua schema ma khong bao - thay doi o day anh huong toan bo pipeline.
 """
 
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
 
 # Layer 1: Router Output
 
 class RoutingResult(BaseModel):
-    """Output của Router Service (Layer 1)."""
+    """Output cua Router Service (Layer 1)."""
 
     modality: str = Field(..., description="'ultrasound' | 'xray' | 'ood'")
     organ: str = Field(..., description="'breast' | 'thyroid' | 'heart' | 'chest' | 'unknown'")
-    confidence: float = Field(..., description="Confidence của routing decision [0, 1]")
+    confidence: float = Field(..., description="Confidence cua routing decision [0, 1]")
     all_scores: dict = Field(
         ...,
-        description="Softmax scores tất cả class, vd: {'us_breast': 0.91, 'us_thyroid': 0.07}"
+        description="Softmax scores tat ca class, vd: {'us_breast': 0.91, 'us_thyroid': 0.07}"
     )
     is_ood: bool = Field(
         default=False,
-        description="True nếu confidence < threshold -> reject trước khi vào vision"
+        description="True neu confidence < threshold -> reject truoc khi vao vision"
     )
     module_key: str = Field(
         ...,
@@ -32,43 +32,43 @@ class RoutingResult(BaseModel):
     router_degraded: bool = Field(
         default=False,
         description=(
-            "True nếu router đang chạy với random weights (checkpoint không tồn tại). "
-            "Khi True, routing decision không có ý nghĩa thống kê - orchestrator PHẢI "
-            "chặn pipeline thay vì tiếp tục chạy với routing ngẫu nhiên."
+            "True neu router dang chay voi random weights (checkpoint khong ton tai). "
+            "Khi True, routing decision khong co y nghia thong ke - orchestrator PHAI "
+            "chan pipeline thay vi tiep tuc chay voi routing ngau nhien."
         ),
     )
     user_hint_modality: Optional[str] = Field(
         default=None,
-        description="Modality user chọn thủ công, None nếu chọn 'Tự động'",
+        description="Modality user chon thu cong, None neu chon 'Tu dong'",
     )
     user_hint_organ: Optional[str] = Field(
         default=None,
-        description="Organ user chọn thủ công, None nếu chọn 'Tự động'",
+        description="Organ user chon thu cong, None neu chon 'Tu dong'",
     )
     hint_conflict: bool = Field(
         default=False,
-        description="True nếu hint của user khác top-1 prediction gốc của router",
+        description="True neu hint cua user khac top-1 prediction goc cua router",
     )
     hint_resolution_note: Optional[str] = Field(
         default=None,
-        description="Giải thích cách router_confidence và user hint được kết hợp để ra quyết định cuối",
+        description="Giai thich cach router_confidence va user hint duoc ket hop de ra quyet dinh cuoi",
     )
     final_decision_source: str = Field(
         default="router",
-        description="'router' | 'user_hint' | 'weighted' - nguồn quyết định cuối cùng cho module_key",
+        description="'router' | 'user_hint' | 'weighted' - nguon quyet dinh cuoi cung cho module_key",
     )
 
 
 # Layer 2: Vision Module Output
 
 class ModelOutput(BaseModel):
-    """Raw output từ UNet_MTL inference (Layer 2)."""
+    """Raw output tu UNet_MTL inference (Layer 2)."""
 
     top_label: str = Field(
         ...,
         description="'benign' | 'malignant' | 'normal'"
     )
-    confidence: float = Field(..., description="Confidence của top_label [0, 1]")
+    confidence: float = Field(..., description="Confidence cua top_label [0, 1]")
     all_scores: dict = Field(
         ...,
         description="{'benign': 0.1, 'malignant': 0.87, 'normal': 0.03}"
@@ -76,21 +76,21 @@ class ModelOutput(BaseModel):
     mask_png_base64: str = Field(
         ...,
         description=(
-            "Binary mask PNG, encoded base64. Truyền trực tiếp qua HTTP body - "
-            "KHÔNG dùng path trên disk vì vision/knowledge là 2 container riêng, "
-            "không share filesystem. Đây là cơ chế stateless duy nhất được hỗ trợ."
+            "Binary mask PNG, encoded base64. Truyen truc tiep qua HTTP body - "
+            "KHONG dung path tren disk vi vision/knowledge la 2 container rieng, "
+            "khong share filesystem. Day la co che stateless duy nhat duoc ho tro."
         ),
     )
     bottleneck_features: dict = Field(
         ...,
         description=(
-            "Summary statistics từ encoder bottleneck (7×7×448). "
+            "Summary statistics tu encoder bottleneck (7x7x448). "
             "Keys: activation_energy, top_channel_activations, attention_hotspot_grid"
         )
     )
     original_size: list = Field(
         default=[512, 512],
-        description="[H, W] của ảnh gốc - dùng để knowledge service tính spatial features"
+        description="[H, W] cua anh goc - dung de knowledge service tinh spatial features"
     )
 
 
@@ -101,7 +101,7 @@ class KnowledgeMapped(BaseModel):
 
     description: str = Field(
         ...,
-        description="Text mô tả từ label + RAG context"
+        description="Text mo ta tu label + RAG context"
     )
     severity: str = Field(
         ...,
@@ -121,24 +121,24 @@ class KnowledgeMapped(BaseModel):
         description=(
             "Breast: 'Low risk (BI-RADS 2-3)' | 'High risk (BI-RADS 4C-5)'. "
             "Thyroid: 'TI-RADS 3' | 'TI-RADS 5'. "
-            "Không lookup JSON - derive từ label + confidence"
+            "Khong lookup JSON - derive tu label + confidence"
         )
     )
     confidence_calibration_note: Optional[str] = Field(
         default=None,
         description=(
-            "Set khi confidence vượt ngưỡng nghi ngờ overfitting (vd >= 0.999) trên dataset "
-            "nhỏ chưa qua calibration. Cảnh báo này KHÔNG phải bug - chỉ để LLM/clinician "
-            "không đọc số % như độ tin cậy tuyệt đối."
+            "Set khi confidence vuot nguong nghi ngo overfitting (vd >= 0.999) tren dataset "
+            "nho chua qua calibration. Canh bao nay KHONG phai bug - chi de LLM/clinician "
+            "khong doc so % nhu do tin cay tuyet doi."
         ),
     )
 
 
 class SpatialDerived(BaseModel):
-    """Spatial features từ segmentation mask (Layer 3, cv2.boundingRect)."""
+    """Spatial features tu segmentation mask (Layer 3, cv2.boundingRect)."""
 
     bbox: list = Field(..., description="[x1, y1, x2, y2] pixel coordinates")
-    area_cm2: float = Field(..., description="Diện tích khối u tính bằng cm² (dùng pixel_spacing)")
+    area_cm2: float = Field(..., description="Dien tich khoi u tinh bang cm2 (dung pixel_spacing)")
     centroid: list = Field(..., description="[cx, cy] pixel coordinates")
     location_quadrant: str = Field(
         ...,
@@ -153,13 +153,13 @@ class SpatialDerived(BaseModel):
     )
     circularity: float = Field(
         ...,
-        description="4π·area/perimeter². 1.0=perfect circle, <0.5=irregular margin (suspicious)"
+        description="4pi*area/perimeter^2. 1.0=perfect circle, <0.5=irregular margin (suspicious)"
     )
     width_px: int
     height_px: int
     location_confidence: str = Field(
         ...,
-        description="'low' | 'medium' | 'high' - dựa trên mask quality"
+        description="'low' | 'medium' | 'high' - dua tren mask quality"
     )
 
 
@@ -167,14 +167,14 @@ class SpatialDerived(BaseModel):
 
 class UnifiedOutput(BaseModel):
     """
-    Schema chuẩn hóa output qua mọi layer.
-    QA Agent chỉ đọc schema này - không biết ảnh từ đâu.
-    Thêm modality mới = thêm pipeline, không sửa schema.
+    Schema chuan hoa output qua moi layer.
+    QA Agent chi doc schema nay - khong biet anh tu dau.
+    Them modality moi = them pipeline, khong sua schema.
     """
 
     modality: str = Field(..., description="'ultrasound' | 'xray'")
     organ: str = Field(..., description="'breast' | 'thyroid' | 'heart' | 'chest'")
-    image_id: str = Field(..., description="Unique ID cho request (UUID hoặc filename)")
+    image_id: str = Field(..., description="Unique ID cho request (UUID hoac filename)")
 
     model_output: ModelOutput
     knowledge_mapped: KnowledgeMapped
@@ -183,20 +183,20 @@ class UnifiedOutput(BaseModel):
     filtered_findings: list = Field(
         default_factory=list,
         description=(
-            "Findings bị drop do confidence thấp - vẫn giữ lại để LLM biết. "
+            "Findings bi drop do confidence thap - van giu lai de LLM biet. "
             "Vd: [{'label': 'normal', 'confidence': 0.03, 'reason': 'below threshold 0.1'}]"
         )
     )
     coverage_note: str = Field(
         default="Model trained on BUSI dataset (benign/malignant/normal only).",
-        description="Cảnh báo về training data scope để LLM không over-generalize"
+        description="Canh bao ve training data scope de LLM khong over-generalize"
     )
 
 
 # Layer 4: Final Report Output
 
 class Tier1Structured(BaseModel):
-    """Tier 1: Structured fields - dễ parse, hiển thị UI."""
+    """Tier 1: Structured fields - de parse, hien thi UI."""
 
     modality: str
     organ: str
@@ -209,45 +209,68 @@ class Tier1Structured(BaseModel):
     location_quadrant: str
     bbox: list = Field(
         default_factory=lambda: [0, 0, 0, 0],
-        description="[x1, y1, x2, y2] pixel coordinates - dùng để vẽ overlay trên UI",
+        description="[x1, y1, x2, y2] pixel coordinates - dung de ve overlay tren UI",
     )
     area_cm2: float
     aspect_ratio: float
     circularity: float
     confidence_calibration_note: Optional[str] = Field(
         default=None,
-        description="Copy từ KnowledgeMapped - hiển thị trực tiếp ở Tier 1 để UI dễ render banner.",
+        description="Copy tu KnowledgeMapped - hien thi truc tiep o Tier 1 de UI de render banner.",
     )
     hint_conflict: bool = Field(
         default=False,
-        description="Copy từ RoutingResult - True nếu user hint khác router top-1 prediction",
+        description="Copy tu RoutingResult - True neu user hint khac router top-1 prediction",
     )
     hint_resolution_note: Optional[str] = Field(
         default=None,
-        description="Copy từ RoutingResult - giải thích cách hint và router confidence được kết hợp",
+        description="Copy tu RoutingResult - giai thich cach hint va router confidence duoc ket hop",
+    )
+
+
+class RagSource(BaseModel):
+    """Citation cu the cho 1 chunk RAG da duoc su dung."""
+
+    file: str = Field(..., description="Ten file PDF nguon")
+    page: int = Field(..., description="So trang trong PDF nguon")
+
+
+class CoTResult(BaseModel):
+    """
+    Ket qua suy luan Chain-of-Thought tu cot_reasoning node.
+    Cung dinh dang voi output cua mapper de so sanh duoc.
+    """
+
+    severity: str
+    severity_level: int
+    icd10_hint: str
+    risk_category: str
+    reasoning: str = Field(
+        ...,
+        description="Audit trail day du tung buoc suy luan: label -> spatial -> RAG -> bottleneck -> ket luan"
     )
 
 
 class ReportOutput(BaseModel):
-    """Final output từ Orchestrator - LLM-generated 3-tier report."""
+    """Final output tu Orchestrator - LLM-generated 3-tier report."""
 
     image_id: str
     tier_1_structured: Tier1Structured = Field(
         ...,
-        description="Structured data fields - parse từ UnifiedOutput, không cần LLM"
+        description="Structured data fields - parse tu UnifiedOutput, khong can LLM"
     )
     tier_2_radiological_description: str = Field(
         ...,
         description=(
-            "LLM-generated: mô tả radiological bằng ngôn ngữ tự nhiên. "
-            "Vd: 'A 1.24 cm² hypoechoic lesion with irregular margins (circularity: 0.42)...'"
+            "LLM-generated: mo ta radiological bang ngon ngu tu nhien. "
+            "Vd: 'A 1.24 cm2 hypoechoic lesion with irregular margins (circularity: 0.42)...'"
         )
     )
     tier_3_diagnostic_suggestion: str = Field(
         ...,
         description=(
-            "LLM-generated: gợi ý chẩn đoán + follow-up. "
-            "KHÔNG phải chẩn đoán cuối cùng - AI assist only."
+            "LLM-generated: goi y chan doan + follow-up. "
+            "KHONG phai chan doan cuoi cung - AI assist only."
         )
     )
     disclaimer: str = Field(
@@ -257,15 +280,31 @@ class ReportOutput(BaseModel):
             "radiologist or physician."
         )
     )
-    rag_sources: list = Field(
+    rag_sources: List[RagSource] = Field(
         default_factory=list,
-        description="Danh sách PDF sources dùng trong RAG retrieval"
+        description="Danh sach citation cu the: file PDF + so trang duoc dung trong RAG"
     )
     rag_disabled_warning: Optional[str] = Field(
         default=None,
         description=(
-            "Set khi FAISS index chưa build / chưa có PDF nào được index. "
-            "Nếu không None, report được sinh ra KHÔNG có clinical guideline retrieval - "
-            "chỉ dựa trên classification label + hardcode mapping. UI phải hiển thị banner cảnh báo."
+            "Set khi FAISS index chua build / chua co PDF nao duoc index. "
+            "Neu khong None, report duoc sinh ra KHONG co clinical guideline retrieval - "
+            "chi dua tren classification label + hardcode mapping. UI phai hien thi banner canh bao."
         ),
+    )
+    mapper_result: Optional[dict] = Field(
+        default=None,
+        description="Ket qua tu rule-based mapper (KnowledgeMapped dict)"
+    )
+    cot_result: Optional[CoTResult] = Field(
+        default=None,
+        description="Ket qua tu CoT reasoning engine (LLM-based)"
+    )
+    consensus: Optional[bool] = Field(
+        default=None,
+        description=(
+            "True neu mapper va CoT dong thuan (severity_level chenh lech <= 1). "
+            "False neu bat dong nhieu hon 1 muc - UI hien thi banner yeu cau radiologist xac nhan. "
+            "None khi CoT chua chay (vi du: loi hoac chua duoc bat)."
+        )
     )

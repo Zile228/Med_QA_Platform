@@ -1,7 +1,7 @@
 """
 ui/app.py
 ==========
-Gradio UI -- giao dien demo cho Med-Platform.
+Gradio UI - giao dien demo cho Med-Platform.
 
 Layout 2 cot x 2 tang:
     Trai tren:  upload anh + dropdown hint + cau hoi + nut Analyze
@@ -70,15 +70,20 @@ def call_orchestrator(
             data=data,
         )
 
-    if resp.status_code == 422:
-        raise gr.Error(f"[Pipeline rejected] {resp.json().get('detail', 'Unknown error')}")
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("detail", resp.text)
+        except Exception:
+            detail = resp.text
+        prefix = "[Pipeline rejected]" if resp.status_code == 422 else f"[Orchestrator error {resp.status_code}]"
+        raise gr.Error(f"{prefix} {detail}")
     resp.raise_for_status()
     return resp.json()
 
 
 def call_chat(image_id: str, message: str, history: list) -> str:
     """
-    Goi /chat voi context da co -- khong gui lai anh.
+    Goi /chat voi context da co - khong gui lai anh.
     history: list[dict] {"role": "user"|"assistant", "content": str}
     """
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
@@ -119,6 +124,29 @@ def draw_bbox_on_image(
     return Image.alpha_composite(img, overlay).convert("RGB")
 
 
+def _build_rag_citations_html(rag_sources: list) -> str:
+    """Render danh sach citation tu rag_sources (list dict {file, page})."""
+    if not rag_sources:
+        return ""
+
+    items = ""
+    for src in rag_sources:
+        if isinstance(src, dict):
+            fname = src.get("file", "unknown")
+            page = src.get("page", 0)
+            items += f'<li><code>{fname}</code>, trang {page}</li>'
+        else:
+            items += f"<li>{src}</li>"
+
+    return f"""
+<div style="margin-top:10px; padding:10px 14px; background:#1a1a2e;
+            border-left:4px solid #585b70; border-radius:4px; font-size:11px; color:#a6adc8;">
+  <b>Nguon tham khao (RAG):</b>
+  <ul style="margin:4px 0 0 16px; padding:0;">{items}</ul>
+</div>
+"""
+
+
 def build_warning_banners(report: dict, t1: dict) -> str:
     """
     Tra ve HTML chuoi cac banner canh bao de dat len dau Document Report.
@@ -153,13 +181,30 @@ def build_warning_banners(report: dict, t1: dict) -> str:
 </div>
 """
 
+    # Banner bao dong khi mapper va CoT bat dong
+    consensus = report.get("consensus")
+    if consensus is False:
+        mapper_r = report.get("mapper_result") or {}
+        cot_r    = report.get("cot_result") or {}
+        banners += f"""
+<div style="background:#2a1a1a; border-left:4px solid #f38ba8; padding:10px 14px;
+            border-radius:4px; color:#f5c2e7; font-size:12px; margin-bottom:8px;">
+  <b>[Bat dong Rule-Engine vs AI Reasoning]</b>
+  Rule engine: severity={mapper_r.get('severity','?')} (level {mapper_r.get('severity_level','?')}),
+  ICD-10={mapper_r.get('icd10_hint','?')}.
+  CoT reasoning: severity={cot_r.get('severity','?')} (level {cot_r.get('severity_level','?')}),
+  ICD-10={cot_r.get('icd10_hint','?')}.
+  <br><b>Can radiologist xac nhan truc tiep do co bat dong giua rule-based va AI reasoning.</b>
+</div>
+"""
+
     return banners
 
 
 def build_document_report_html(report: dict) -> str:
     """
     Gop 3 tier thanh 1 bao cao y khoa lien mach theo format radiology chuan:
-    Banners -> Patient/Study Info -> Findings -> Impression -> Disclaimer.
+    Banners -> Patient/Study Info -> Findings -> Impression -> Citations -> Disclaimer.
     """
     t1  = report.get("tier_1_structured", {})
     t2  = report.get("tier_2_radiological_description", "")
@@ -171,8 +216,8 @@ def build_document_report_html(report: dict) -> str:
     dots     = "*" * level + "-" * (4 - level)
 
     banners = build_warning_banners(report, t1)
+    citations_html = _build_rag_citations_html(report.get("rag_sources", []))
 
-    # Canh bao dat truoc Findings theo yeu cau cua TODO section 5.1
     return f"""
 <div style="font-family: 'Segoe UI', monospace; background:#1e1e2e; color:#cdd6f4;
             padding:20px; border-radius:10px; line-height:1.8; font-size:13px;">
@@ -223,6 +268,8 @@ def build_document_report_html(report: dict) -> str:
     <span style="color:#89b4fa; font-weight:bold;">Impression &amp; Recommendation</span><br>
     <span style="color:#cdd6f4">{t3}</span>
   </div>
+
+  {citations_html}
 
   <div style="background:#2a1a1a; border-left:4px solid #f38ba8; padding:10px 14px;
               border-radius:4px; color:#f5c2e7; font-size:12px; margin-top:4px;">
@@ -289,7 +336,7 @@ def send_chat(
     image_id: str,
 ):
     """
-    Gradio callback cho chatbot -- goi /chat khong gui lai anh.
+    Gradio callback cho chatbot - goi /chat khong gui lai anh.
 
     chat_history: list[dict] {"role": "user"|"assistant", "content": str}.
     Phai sanitize truoc khi gui sang orchestrator (Gradio co the them key la).
@@ -350,7 +397,6 @@ label, .label-wrap span, .svelte-1gfkn6j {
 }
 footer { display: none !important; }
 
-/* Ghi de mau nen/chu cho chatbot bubble cua Gradio */
 .message-wrap, [data-testid="bot"], [data-testid="user"] {
     color: #cdd6f4 !important;
 }

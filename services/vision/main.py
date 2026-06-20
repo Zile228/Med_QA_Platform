@@ -7,9 +7,10 @@ Endpoints:
     POST /analyze/us_breast   - breast ultrasound inference
     POST /analyze/us_thyroid  - thyroid ultrasound inference (TN3K)
     GET  /health
+    GET  /metrics             - Prometheus metrics
 
 Request: multipart/form-data
-    image: UploadFile  - ảnh PNG/JPG
+    image: UploadFile  - anh PNG/JPG
     organ: str         - 'breast' | 'thyroid'
 
 Response: ModelOutput schema (JSON)
@@ -17,25 +18,40 @@ Response: ModelOutput schema (JSON)
 
 import os
 import sys
+import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
-from fastapi.responses import JSONResponse
+from fastapi.responses import PlainTextResponse
 
 sys.path.insert(0, "/app")
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from shared.schemas import ModelOutput
+from shared.telemetry import setup_tracing, get_tracer
 from services.vision.us_breast.model  import load_model as load_breast_model,  run_inference as run_breast_inference
 from services.vision.us_thyroid.model import load_model as load_thyroid_model, run_inference as run_thyroid_inference
 
-# Cau hinh tu env
+try:
+    from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
+    PROM_AVAILABLE = True
+    _infer_latency = Histogram(
+        "vision_inference_duration_seconds",
+        "Latency cua inference theo organ",
+        ["organ"],
+        buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
+    )
+    _infer_counter = Counter(
+        "vision_inference_requests_total",
+        "Tong so request inference",
+        ["organ", "label", "status"],
+    )
+except ImportError:
+    PROM_AVAILABLE = False
 
 BUSI_CHECKPOINT    = os.getenv("BUSI_CHECKPOINT",    "models/checkpoints/mtl_effnet_fc_conv.pt")
 THYROID_CHECKPOINT = os.getenv("THYROID_CHECKPOINT", "models/checkpoints/mtl_effnet_fc_conv_thyroid.pt")
 DEVICE             = os.getenv("DEVICE", None)
-
-# Load ca hai model khi khoi dong
 
 _breast_model  = None
 _breast_cfg    = None
@@ -47,27 +63,26 @@ _thyroid_cfg   = None
 async def lifespan(app: FastAPI):
     global _breast_model, _breast_cfg, _thyroid_model, _thyroid_cfg
 
-    # Breast model
+    setup_tracing("vision", app=app)
+
     try:
         _breast_model, _breast_cfg = load_breast_model(BUSI_CHECKPOINT, DEVICE)
         print(f"[vision] Breast model loaded OK - device: {_breast_cfg.DEVICE}")
     except FileNotFoundError as e:
         print(f"[vision] WARNING (breast): {e}")
-        print("[vision] /analyze/us_breast sẽ return 503 cho đến khi có checkpoint.")
+        print("[vision] /analyze/us_breast se return 503 cho den khi co checkpoint.")
 
-    # Thyroid model
     try:
         _thyroid_model, _thyroid_cfg = load_thyroid_model(THYROID_CHECKPOINT, DEVICE)
         print(f"[vision] Thyroid model loaded OK - device: {_thyroid_cfg.DEVICE}")
     except FileNotFoundError as e:
         print(f"[vision] WARNING (thyroid): {e}")
-        print("[vision] /analyze/us_thyroid sẽ return 503 cho đến khi có checkpoint.")
+        print("[vision] /analyze/us_thyroid se return 503 cho den khi co checkpoint.")
 
     yield
 
     _breast_model  = None
     _thyroid_model = None
-
 
 
 app = FastAPI(
@@ -76,7 +91,6 @@ app = FastAPI(
     version="2.0.0",
     lifespan=lifespan,
 )
-
 
 
 @app.get("/health")
@@ -90,44 +104,62 @@ def health():
     }
 
 
+@app.get("/metrics", response_class=PlainTextResponse)
+def metrics():
+    if not PROM_AVAILABLE:
+        return PlainTextResponse("# prometheus_client chua install\n", status_code=200)
+    return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
 
 async def _read_image(image: UploadFile) -> bytes:
-    """Đọc và validate ảnh upload."""
+    """Doc va validate anh upload."""
     image_bytes = await image.read()
     if not image_bytes:
-        raise HTTPException(status_code=400, detail="File ảnh rỗng.")
+        raise HTTPException(status_code=400, detail="File anh rong.")
     content_type = image.content_type or ""
     if content_type and not content_type.startswith("image/"):
         raise HTTPException(
             status_code=400,
-            detail=f"File không phải ảnh: {content_type}"
+            detail=f"File khong phai anh: {content_type}",
         )
     return image_bytes
 
 
-# Endpoint cho Breast Ultrasound
-
 @app.post("/analyze/us_breast", response_model=ModelOutput)
 async def analyze_us_breast(
-    image: UploadFile = File(..., description="Ảnh ultrasound breast (PNG/JPG)"),
+    image: UploadFile = File(..., description="Anh ultrasound breast (PNG/JPG)"),
     organ: str = Form(default="breast"),
 ):
     """
-    Inference pipeline cho Breast Ultrasound (BUSI dataset):
-    1. Nhận ảnh bytes
-    2. run_inference -> mask (base64) + classification + bottleneck
-    3. Trả về ModelOutput
+    Inference pipeline cho Breast Ultrasound (BUSI dataset).
+    Tra ve ModelOutput co bottleneck_features de orchestrator dua vao LLM prompt.
     """
     if _breast_model is None:
         raise HTTPException(
             status_code=503,
-            detail="Breast model chưa load. Đặt checkpoint vào models/checkpoints/ và restart.",
+            detail="Breast model chua load. Dat checkpoint vao models/checkpoints/ va restart.",
         )
     image_bytes = await _read_image(image)
-    try:
-        result = run_breast_inference(model=_breast_model, cfg=_breast_cfg, image_bytes=image_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+    t_start = time.perf_counter()
+    with get_tracer().start_as_current_span("vision.us_breast") as span:
+        try:
+            result = run_breast_inference(
+                model=_breast_model, cfg=_breast_cfg, image_bytes=image_bytes
+            )
+            span.set_attribute("vision.organ",      "breast")
+            span.set_attribute("vision.top_label",  result.get("top_label", ""))
+            span.set_attribute("vision.confidence", result.get("confidence", 0.0))
+            if PROM_AVAILABLE:
+                _infer_counter.labels(
+                    organ="breast", label=result.get("top_label", "unknown"), status="ok"
+                ).inc()
+                _infer_latency.labels(organ="breast").observe(time.perf_counter() - t_start)
+        except Exception as e:
+            span.record_exception(e)
+            if PROM_AVAILABLE:
+                _infer_counter.labels(organ="breast", label="unknown", status="error").inc()
+            raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
     return ModelOutput(
         top_label=result["top_label"],
@@ -139,36 +171,45 @@ async def analyze_us_breast(
     )
 
 
-# Endpoint cho Thyroid Ultrasound
-
 @app.post("/analyze/us_thyroid", response_model=ModelOutput)
 async def analyze_us_thyroid(
-    image: UploadFile = File(..., description="Ảnh ultrasound thyroid (PNG/JPG)"),
+    image: UploadFile = File(..., description="Anh ultrasound thyroid (PNG/JPG)"),
     organ: str = Form(default="thyroid"),
 ):
     """
-    Inference pipeline cho Thyroid Ultrasound (TN3K dataset):
-    1. Nhận ảnh bytes
-    2. run_inference -> mask (base64) + classification (benign/malignant) + bottleneck
-    3. Trả về ModelOutput - cùng schema với us_breast
-
-    Model: UNet_MTL với EfficientNet-B4, FC head, 2 classes.
-    Checkpoint: models/checkpoints/mtl_effnet_fc_conv_thyroid.pt
+    Inference pipeline cho Thyroid Ultrasound (TN3K dataset).
+    Cung schema voi us_breast -- orchestrator dung chung 1 code path.
     """
     if _thyroid_model is None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Thyroid model chưa load. "
-                "Chạy notebook tn3k_thyroid_train.ipynb để tạo checkpoint, "
-                "sau đó đặt vào models/checkpoints/mtl_effnet_fc_conv_thyroid.pt và restart."
+                "Thyroid model chua load. "
+                "Chay notebook tn3k_thyroid_train.ipynb de tao checkpoint, "
+                "sau do dat vao models/checkpoints/mtl_effnet_fc_conv_thyroid.pt va restart."
             ),
         )
     image_bytes = await _read_image(image)
-    try:
-        result = run_thyroid_inference(model=_thyroid_model, cfg=_thyroid_cfg, image_bytes=image_bytes)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+    t_start = time.perf_counter()
+    with get_tracer().start_as_current_span("vision.us_thyroid") as span:
+        try:
+            result = run_thyroid_inference(
+                model=_thyroid_model, cfg=_thyroid_cfg, image_bytes=image_bytes
+            )
+            span.set_attribute("vision.organ",      "thyroid")
+            span.set_attribute("vision.top_label",  result.get("top_label", ""))
+            span.set_attribute("vision.confidence", result.get("confidence", 0.0))
+            if PROM_AVAILABLE:
+                _infer_counter.labels(
+                    organ="thyroid", label=result.get("top_label", "unknown"), status="ok"
+                ).inc()
+                _infer_latency.labels(organ="thyroid").observe(time.perf_counter() - t_start)
+        except Exception as e:
+            span.record_exception(e)
+            if PROM_AVAILABLE:
+                _infer_counter.labels(organ="thyroid", label="unknown", status="error").inc()
+            raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
     return ModelOutput(
         top_label=result["top_label"],
@@ -179,13 +220,11 @@ async def analyze_us_thyroid(
         original_size=list(result["original_size"]),
     )
 
-
-# Placeholder cho X-ray (chua implement)
 
 @app.post("/analyze/xray")
 async def analyze_xray(image: UploadFile = File(...)):
     """Placeholder - Phase 2 (NIH ChestX-ray14)."""
     raise HTTPException(
         status_code=501,
-        detail="X-Ray module chưa implement. Roadmap: Phase 2.",
+        detail="X-Ray module chua implement. Roadmap: Phase 2.",
     )
