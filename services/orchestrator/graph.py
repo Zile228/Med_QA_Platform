@@ -1,30 +1,33 @@
 """
 services/orchestrator/graph.py
 ================================
-LangGraph pipeline -- dieu phoi toan bo flow.
+LangGraph pipeline - orchestrates the entire flow.
 
-Graph (fan-out/fan-in):
-    route -> vision  -> knowledge -> merge -> qa_agent
-          -> rag_retrieve         ->
+Graph (fan-out/fan-in after adding CoT):
+    route -> vision -> knowledge  --|
+          -> cot_reasoning        --|-> merge -> consistency_guard -> qa_agent
+          -> rag_retrieve         --|
 
-    route xong thi vision va rag_retrieve chay song song.
-    merge doi CA HAI nhanh xong roi moi chay qa_agent.
+    The three branches after route run in parallel (knowledge + cot_reasoning + rag).
+    merge waits for ALL THREE branches before running consistency_guard.
+    consistency_guard compares severity_level (consensus) and icd10_hint (icd10_agreement)
+    of mapper vs CoT, two separate flags since they are two different clinical questions.
 
-State (OrchestratorState) chay xuyen suot graph.
-
-Moi node = 1 HTTP call den service tuong ung:
-    route_node        -> POST router:8001/route
-    vision_node       -> POST vision:8002/analyze/{modality}
-    knowledge_node    -> POST knowledge:8003/map
-    rag_node          -> FAISS retrieve (local, khong HTTP)
-    merge_node        -> kiem tra state, short-circuit neu co loi
-    qa_agent_node     -> LLM generate 3-tier report
+Each node = 1 HTTP call to the corresponding service:
+    route_node            -> POST router:8001/route
+    vision_node           -> POST vision:8002/analyze/{modality}
+    knowledge_node        -> POST knowledge:8003/map
+    cot_reasoning_node    -> LLM Chain-of-Thought (runs in parallel with knowledge)
+    rag_node              -> FAISS retrieve (local, no HTTP)
+    merge_node            -> checks state, short-circuits on error
+    consistency_guard_node -> compares mapper vs CoT, sets consensus flag
+    qa_agent_node         -> LLM generates the 3-tier report
 
 Public API:
     build_graph(services_cfg, llm_client, rag_store, registry) -> CompiledGraph
     run_pipeline(graph, image_bytes, question, image_id,
                  modality_hint, organ_hint) -> ReportOutput dict
-    run_pipeline_async(...) -> ReportOutput dict  (cho FastAPI async handler)
+    run_pipeline_async(...) -> ReportOutput dict  (for FastAPI async handler)
 """
 
 import asyncio
@@ -39,29 +42,30 @@ try:
     LANGGRAPH_AVAILABLE = True
 except ImportError:
     LANGGRAPH_AVAILABLE = False
-    print("[orchestrator] langgraph chua install, dung sequential fallback")
+    print("[orchestrator] langgraph not installed, using sequential fallback")
 
 from shared.schemas import (
     RoutingResult, ModelOutput, KnowledgeMapped,
-    SpatialDerived, UnifiedOutput, ReportOutput, Tier1Structured
+    SpatialDerived, UnifiedOutput, ReportOutput, Tier1Structured,
+    RagSource, CoTResult,
 )
+from shared.telemetry import get_tracer
 
 
-# Reducer cho LangGraph state
+# Reducers for LangGraph state
 
 def _keep_last(a, b):
-    """Reducer: keep the latest non-None value. Used for all Optional fields."""
+    """Reducer: keep the newest non-None value."""
     return b if b is not None else a
 
 
 def _merge_list(a, b):
-    """Reducer: keep the latest non-empty list. Used for rag_chunks."""
+    """Reducer: keep the newest list if non-empty."""
     return b if b else a
 
 
-
 class OrchestratorState(TypedDict):
-    # Input - never written by nodes after init, but Annotated is harmless
+    # Input - unchanged after init
     image_bytes:    bytes
     question:       str
     image_id:       str
@@ -74,12 +78,20 @@ class OrchestratorState(TypedDict):
     # Layer 2 output
     model_output:   Annotated[Optional[dict], _keep_last]
 
-    # Layer 3 output
+    # Layer 3 output from the rule-based mapper
     knowledge:      Annotated[Optional[dict], _keep_last]
     spatial:        Annotated[Optional[dict], _keep_last]
 
-    # RAG context -- tu nhanh song song voi vision
+    # Layer 3 output from the CoT engine (runs in parallel with knowledge)
+    cot_result:     Annotated[Optional[dict], _keep_last]
+
+    # RAG context from the branch running in parallel with vision
     rag_chunks:     Annotated[list, _merge_list]
+    rag_meta:       Annotated[list, _merge_list]
+
+    # Result of comparing mapper vs CoT
+    consensus:      Annotated[Optional[bool], _keep_last]
+    icd10_agreement: Annotated[Optional[bool], _keep_last]
 
     # Final output
     report:         Annotated[Optional[dict], _keep_last]
@@ -88,7 +100,7 @@ class OrchestratorState(TypedDict):
     error:          Annotated[Optional[str], _keep_last]
 
 
-# Helper goi HTTP
+# HTTP call helpers
 
 def _post_json(url: str, json_body: dict, timeout: int = 60) -> dict:
     with httpx.Client(timeout=timeout) as client:
@@ -117,7 +129,7 @@ async def _post_multipart_async(
     fields: dict = None,
     timeout: int = 120,
 ) -> dict:
-    """Phien ban async cua _post_multipart -- dung cho async node."""
+    """Async version of _post_multipart - used by async nodes."""
     files = {"image": ("image.png", image_bytes, "image/png")}
     data = fields or {}
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -137,7 +149,7 @@ async def _post_json_async(
         return resp.json()
 
 
-# Xay dung prompt cho LLM
+# Building prompts for the LLM
 
 SYSTEM_PROMPT = """You are an AI radiology assistant helping generate structured clinical reports.
 You receive structured image analysis data and must produce clear, professional radiological descriptions.
@@ -150,9 +162,42 @@ analyzed medical image. You have access to the full analysis report including cl
 features, and retrieved clinical guidelines. Answer concisely and accurately based on the provided context.
 Never make a definitive diagnosis -- always recommend confirmation by a qualified radiologist."""
 
+COT_SYSTEM_PROMPT = """You are a clinical reasoning engine for medical imaging analysis.
+Reason step by step, showing your work explicitly.
+Your output MUST be valid JSON matching the schema provided. Output ONLY the JSON object, no preamble."""
 
-def _build_report_prompt(unified: dict, question: str, rag_chunks: list) -> str:
-    """Build prompt cho LLM tu UnifiedOutput + user question + RAG context."""
+
+def _format_bottleneck(bottleneck: dict) -> str:
+    """Format bottleneck_features into descriptive text for the prompt."""
+    if not bottleneck:
+        return "Bottleneck features: no data available."
+
+    energy = bottleneck.get("activation_energy", "N/A")
+    hotspot = bottleneck.get("attention_hotspot_grid", [])
+    top_ch = bottleneck.get("top_channel_activations", [])
+
+    # hotspot is a single [row, col] coordinate pair (where the model focuses most),
+    # NOT a 2D matrix -- see services/vision/us_breast/model.py: hotspot_pos = [row, col]
+    hotspot_str = ""
+    if hotspot and len(hotspot) == 2:
+        hotspot_str = f"region [{hotspot[0]},{hotspot[1]}] (7x7 grid)"
+
+    return (
+        f"Bottleneck activation energy: {energy}. "
+        f"Strongest attention focus: {hotspot_str or 'undetermined'}. "
+        f"Top channels: {top_ch[:3] if top_ch else 'N/A'}."
+    )
+
+
+def _build_report_prompt(
+    unified: dict,
+    question: str,
+    rag_chunks: list,
+    cot_result: Optional[dict] = None,
+    consensus: Optional[bool] = None,
+    icd10_agreement: Optional[bool] = None,
+) -> str:
+    """Build the LLM prompt from UnifiedOutput + user question + RAG context + CoT."""
     rag_context = (
         "\n\n".join(rag_chunks) if rag_chunks
         else "No additional clinical guidelines retrieved."
@@ -160,6 +205,46 @@ def _build_report_prompt(unified: dict, question: str, rag_chunks: list) -> str:
     km = unified.get("knowledge_mapped", {})
     sd = unified.get("spatial_derived", {})
     mo = unified.get("model_output", {})
+    bottleneck_text = _format_bottleneck(mo.get("bottleneck_features", {}))
+
+    consensus_block = ""
+    if cot_result is not None:
+        if consensus is False:
+            cot_sev = cot_result.get("severity", "unknown")
+            cot_icd = cot_result.get("icd10_hint", "unknown")
+            cot_risk = cot_result.get("risk_category", "unknown")
+            cot_reason = cot_result.get("reasoning", "")
+            mapper_sev = km.get("severity", "unknown")
+            mapper_icd = km.get("icd10_hint", "unknown")
+            consensus_block = f"""
+### Disagreement between Rule Engine and AI Reasoning (consensus: false)
+Rule engine (mapper): severity={mapper_sev}, icd10={mapper_icd}
+CoT reasoning:        severity={cot_sev},   icd10={cot_icd}, risk={cot_risk}
+CoT audit trail: {cot_reason}
+
+IMPORTANT: In Tier 3, CLEARLY present BOTH perspectives and state:
+"Radiologist confirmation required due to disagreement between rule-based and AI reasoning."
+"""
+        else:
+            cot_reason = cot_result.get("reasoning", "")
+            consensus_block = f"""
+### AI Reasoning (agrees with the rule engine)
+CoT audit trail: {cot_reason}
+"""
+
+    # icd10_agreement is a question separate from consensus -- severity can
+    # agree while the ICD-10 codes still differ, requiring an independent
+    # warning to the LLM.
+    icd10_block = ""
+    if icd10_agreement is False and consensus is not False:
+        mapper_icd = km.get("icd10_hint", "unknown")
+        cot_icd = (cot_result or {}).get("icd10_hint", "unknown")
+        icd10_block = f"""
+### ICD-10 Code Disagreement (icd10_agreement: false)
+Rule engine (mapper) suggests icd10={mapper_icd}, CoT reasoning suggests icd10={cot_icd}.
+Severity agrees but the ICD-10 codes differ -- this is an independent clinical
+disagreement, you MUST state BOTH codes in Tier 2 and Tier 3.
+"""
 
     prompt = f"""
 ## Clinical Image Analysis -- Structured Report Generation
@@ -182,9 +267,13 @@ def _build_report_prompt(unified: dict, question: str, rag_chunks: list) -> str:
 - Circularity: {sd.get('circularity', 0)} (<0.5 = irregular margin / suspicious)
 - Bounding box: {sd.get('bbox', [])}
 
+### Model Attention (Bottleneck Features)
+{bottleneck_text}
+Note: if the attention region diverges significantly from the segmentation bbox, this is a signal the model is uncertain.
+
 ### Clinical Coverage Note
 {unified.get('coverage_note', '')}
-
+{consensus_block}{icd10_block}
 ### Retrieved Clinical Guidelines
 {rag_context}
 
@@ -194,14 +283,73 @@ Please generate:
 
 **TIER 2 -- Radiological Description** (2-3 sentences, professional radiological language):
 Describe the findings using the spatial and classification data above.
+{"Both ICD-10 codes above must be mentioned explicitly since they disagree." if icd10_block else f"Reference the ICD-10 code {km.get('icd10_hint', '')} and severity {km.get('severity', '')} explicitly."}
 
 **TIER 3 -- Diagnostic Suggestion** (2-3 sentences, include follow-up recommendation):
 Based on the findings and clinical guidelines, suggest next steps. Do NOT make a definitive diagnosis.
 Start with: "AI-assisted suggestion (must be confirmed by radiologist):"
+{"Include both rule-based and AI reasoning perspectives, ending with the disagreement note above." if consensus is False else ""}
+{"Mention both ICD-10 codes and note the discrepancy requires radiologist review." if icd10_block else ""}
 
 Answer the user's question: "{question}"
 """
     return prompt.strip()
+
+
+def _build_cot_prompt(
+    top_label: str,
+    confidence: float,
+    all_scores: dict,
+    spatial: dict,
+    bottleneck: dict,
+    rag_chunks: list,
+    organ: str,
+) -> str:
+    """
+    Build the Chain-of-Thought prompt to reason independently of the mapper.
+    CoT MUST NOT know the mapper's result before reasoning.
+    Output is a JSON object matching the CoTResult schema.
+    """
+    rag_text = "\n\n".join(rag_chunks) if rag_chunks else "No clinical guidelines available."
+    bottleneck_text = _format_bottleneck(bottleneck)
+
+    return f"""You are analyzing a {organ} ultrasound image.
+
+Reason through the following data step by step, then output your conclusion as JSON.
+
+## Step 1: Classification Result
+- Top label: {top_label} (confidence: {confidence:.2%})
+- All scores: {json.dumps(all_scores)}
+
+## Step 2: Spatial Features
+- Location: {spatial.get('location_quadrant', 'unknown')}
+- Area: {spatial.get('area_cm2', 0):.3f} cm2
+- Aspect ratio: {spatial.get('aspect_ratio', 0):.3f} (>1.5 suspicious)
+- Circularity: {spatial.get('circularity', 0):.3f} (<0.5 irregular margin)
+
+## Step 3: Model Attention
+{bottleneck_text}
+If attention hotspot differs significantly from the bbox, note model uncertainty.
+
+## Step 4: Clinical Guidelines (RAG)
+{rag_text}
+
+## Step 5: Conclude
+Based on all steps above, determine:
+- severity: one of "incidental" | "significant" | "urgent" | "critical"
+- severity_level: integer 1-4 matching severity
+- icd10_hint: appropriate ICD-10 code for {organ} + {top_label}
+- risk_category: clinical risk description (e.g. "High suspicion (BI-RADS 4C-5)")
+- reasoning: full audit trail as a single string covering all 5 steps
+
+Output ONLY valid JSON, no markdown, no explanation outside JSON:
+{{
+  "severity": "...",
+  "severity_level": 0,
+  "icd10_hint": "...",
+  "risk_category": "...",
+  "reasoning": "Step 1: ... Step 2: ... Step 3: ... Step 4: ... Step 5: ..."
+}}"""
 
 
 def _build_chat_prompt(
@@ -211,10 +359,11 @@ def _build_chat_prompt(
     message: str,
 ) -> str:
     """
-    Build prompt multi-turn cho chatbot tu context da co + history.
+    Build the multi-turn chatbot prompt from existing context + history.
 
-    unified_context: dict chua unified output + report tu lan analyze goc.
-    history: list[dict] voi keys 'role' va 'content'.
+    unified_context: dict containing the unified output + report from the
+                      original analyze call.
+    history: list[dict] with keys 'role' and 'content'.
     """
     rag_context = (
         "\n\n".join(rag_chunks) if rag_chunks
@@ -257,176 +406,434 @@ Retrieved clinical guidelines:
     return f"{context_block}\n\n## Conversation History{history_block}\n\nUSER: {message}"
 
 
-# Cac node cua LangGraph
+# LangGraph nodes
 
 ALLOW_DEGRADED_ROUTER = os.getenv("ALLOW_DEGRADED_ROUTER", "false").lower() == "true"
 
 
 def make_route_node(router_url: str):
     """
-    Async node -- goi /route voi hint neu co.
-    hint_conflict/hint_resolution_note/final_decision_source duoc copy vao state
-    de report_node co the dua vao tier_1_structured.
+    Async node - calls /route with a hint if provided.
+    hint_conflict/hint_resolution_note/final_decision_source are copied into
+    state so report_node can use them in tier_1_structured.
     """
     async def route_node(state: OrchestratorState) -> dict:
-        try:
-            fields = {}
-            if state.get("modality_hint"):
-                fields["modality_hint"] = state["modality_hint"]
-            if state.get("organ_hint"):
-                fields["organ_hint"] = state["organ_hint"]
+        with get_tracer().start_as_current_span("graph.route") as span:
+            span.set_attribute("image_id", state.get("image_id", ""))
+            try:
+                fields = {}
+                if state.get("modality_hint"):
+                    fields["modality_hint"] = state["modality_hint"]
+                if state.get("organ_hint"):
+                    fields["organ_hint"] = state["organ_hint"]
 
-            result = await _post_multipart_async(
-                f"{router_url}/route",
-                state["image_bytes"],
-                fields=fields or None,
-            )
+                result = await _post_multipart_async(
+                    f"{router_url}/route",
+                    state["image_bytes"],
+                    fields=fields or None,
+                )
 
-            if result.get("router_degraded") and not ALLOW_DEGRADED_ROUTER:
-                return {
-                    "routing": result,
-                    "error": (
-                        "Router dang chay voi random weights (chua co checkpoint da train). "
-                        "Routing decision khong co y nghia va co the route nham modality "
-                        "ma khong co canh bao. Pipeline bi chan de tranh sinh report sai. "
-                        "Dat checkpoint vao models/checkpoints/router_effnet_b0.pt, hoac set "
-                        "ALLOW_DEGRADED_ROUTER=true trong .env neu day la moi truong dev/demo."
-                    ),
-                }
+                if result.get("router_degraded") and not ALLOW_DEGRADED_ROUTER:
+                    span.set_attribute("route.degraded", True)
+                    return {
+                        "routing": result,
+                        "error": (
+                            "Router is running with random weights (no trained checkpoint loaded). "
+                            "The routing decision is meaningless and could route the wrong modality "
+                            "without warning. Pipeline blocked to avoid generating an incorrect report. "
+                            "Place a checkpoint at models/checkpoints/router_effnet_b0.pt, or set "
+                            "ALLOW_DEGRADED_ROUTER=true in .env if this is a dev/demo environment."
+                        ),
+                    }
 
-            if result.get("is_ood"):
-                return {
-                    "routing": result,
-                    "error": (
-                        f"Image rejected as out-of-distribution "
-                        f"(confidence {result.get('confidence', 0):.0%} < threshold). "
-                        "Please upload a breast or thyroid ultrasound image."
-                    ),
-                }
+                if result.get("is_ood"):
+                    span.set_attribute("route.is_ood", True)
+                    return {
+                        "routing": result,
+                        "error": (
+                            f"Image rejected as out-of-distribution "
+                            f"(confidence {result.get('confidence', 0):.0%} < threshold). "
+                            "Please upload a breast or thyroid ultrasound image."
+                        ),
+                    }
 
-            return {"routing": result}
+                span.set_attribute("route.module_key",  result.get("module_key", ""))
+                span.set_attribute("route.organ",       result.get("organ", ""))
+                span.set_attribute("route.confidence",  result.get("confidence", 0.0))
+                return {"routing": result}
 
-        except Exception as e:
-            return {"error": f"[route_node] {e}"}
+            except Exception as e:
+                span.record_exception(e)
+                return {"error": f"[route_node] {e}"}
     return route_node
 
 
 def make_vision_node(vision_url: str, registry=None):
     """
-    registry: ModuleRegistry instance -- doc that tu module_registry.yaml.
-    Neu None, fallback ve dict hardcode (chi dung cho test/dev).
+    registry: ModuleRegistry instance - reads facts from module_registry.yaml.
+    If None, falls back to a hardcoded dict (test/dev use only).
     """
     async def vision_node(state: OrchestratorState) -> dict:
         if state.get("error"):
-            return {}
-        routing = state.get("routing", {})
+            # Return an empty dict so LangGraph keeps the current state unchanged
+            return {"model_output": state.get("model_output")}
+        routing = state.get("routing") or {}
         organ = routing.get("organ", "breast")
         module_key = routing.get("module_key", "us_breast")
 
-        try:
-            if registry is not None:
-                endpoint = registry.vision_endpoint_for(module_key)
-            else:
-                endpoint_map = {
-                    "us_breast":  "/analyze/us_breast",
-                    "us_thyroid": "/analyze/us_thyroid",
-                    "xray":       "/analyze/xray",
-                }
-                endpoint = endpoint_map.get(module_key, "/analyze/us_breast")
-        except Exception as e:
-            return {"error": f"[vision_node] {e}"}
+        with get_tracer().start_as_current_span("graph.vision") as span:
+            span.set_attribute("image_id",   state.get("image_id", ""))
+            span.set_attribute("vision.organ", organ)
+            try:
+                if registry is not None:
+                    endpoint = registry.vision_endpoint_for(module_key)
+                else:
+                    endpoint_map = {
+                        "us_breast":  "/analyze/us_breast",
+                        "us_thyroid": "/analyze/us_thyroid",
+                        "xray":       "/analyze/xray",
+                    }
+                    endpoint = endpoint_map.get(module_key, "/analyze/us_breast")
+            except Exception as e:
+                return {"error": f"[vision_node] {e}"}
 
-        try:
-            result = await _post_multipart_async(
-                f"{vision_url}{endpoint}",
-                state["image_bytes"],
-                fields={"organ": organ},
-            )
-            return {"model_output": result}
-        except Exception as e:
-            return {"error": f"[vision_node] {e}"}
+            try:
+                result = await _post_multipart_async(
+                    f"{vision_url}{endpoint}",
+                    state["image_bytes"],
+                    fields={"organ": organ},
+                )
+                span.set_attribute("vision.top_label",  result.get("top_label", ""))
+                span.set_attribute("vision.confidence", result.get("confidence", 0.0))
+                return {"model_output": result}
+            except Exception as e:
+                span.record_exception(e)
+                return {"error": f"[vision_node] {e}"}
     return vision_node
+
+
+def make_spatial_node(knowledge_url: str):
+    """
+    Separates the spatial derive step (from the segmentation mask) out of
+    knowledge_node.
+
+    Reason: spatial_derived (bbox, area, aspect_ratio, circularity) is computed
+    PURELY from the segmentation mask -- it has nothing to do with severity
+    mapping (rule-based). It used to only be available after knowledge_node
+    (running in parallel with cot_reasoning_node) finished, so cot_reasoning_node
+    always read spatial=None/empty (race condition). This node runs right
+    after vision, before fanning out to knowledge/cot_reasoning, so both see
+    the real spatial data instead of an empty {}.
+    """
+    async def spatial_node(state: OrchestratorState) -> dict:
+        if state.get("error"):
+            return {"spatial": state.get("spatial")}
+
+        routing = state.get("routing") or {}
+        mo = state.get("model_output") or {}
+
+        payload = {
+            "modality":            routing.get("modality", "ultrasound"),
+            "organ":               routing.get("organ", "breast"),
+            "top_label":           mo.get("top_label", "benign"),
+            "confidence":          mo.get("confidence", 0.0),
+            "all_scores":          mo.get("all_scores", {}),
+            "mask_png_base64":     mo.get("mask_png_base64", ""),
+            "original_size":       list(mo.get("original_size", [512, 512])),
+            "pixel_spacing_mm":    0.1,
+            "bottleneck_features": mo.get("bottleneck_features", {}),
+        }
+
+        with get_tracer().start_as_current_span("graph.spatial") as span:
+            span.set_attribute("image_id", state.get("image_id", ""))
+            try:
+                result = await _post_json_async(f"{knowledge_url}/map", payload)
+                spatial = result.get("spatial_derived", {})
+                span.set_attribute("spatial.area_cm2", spatial.get("area_cm2", 0.0))
+                return {"spatial": spatial}
+            except Exception as e:
+                span.record_exception(e)
+                return {"error": f"[spatial_node] {e}"}
+    return spatial_node
 
 
 def make_knowledge_node(knowledge_url: str):
     async def knowledge_node(state: OrchestratorState) -> dict:
         if state.get("error"):
-            return {}
+            return {"knowledge": state.get("knowledge"), "spatial": state.get("spatial")}
 
-        routing = state.get("routing", {})
-        mo = state.get("model_output", {})
+        routing = state.get("routing") or {}
+        mo = state.get("model_output") or {}
 
         payload = {
-            "modality":         routing.get("modality", "ultrasound"),
-            "organ":            routing.get("organ", "breast"),
-            "top_label":        mo.get("top_label", "benign"),
-            "confidence":       mo.get("confidence", 0.0),
-            "all_scores":       mo.get("all_scores", {}),
-            "mask_png_base64":  mo.get("mask_png_base64", ""),
-            "original_size":    list(mo.get("original_size", [512, 512])),
-            "pixel_spacing_mm": 0.1,
+            "modality":            routing.get("modality", "ultrasound"),
+            "organ":               routing.get("organ", "breast"),
+            "top_label":           mo.get("top_label", "benign"),
+            "confidence":          mo.get("confidence", 0.0),
+            "all_scores":          mo.get("all_scores", {}),
+            "mask_png_base64":     mo.get("mask_png_base64", ""),
+            "original_size":       list(mo.get("original_size", [512, 512])),
+            "pixel_spacing_mm":    0.1,
+            # Pass-through bottleneck_features - the knowledge service doesn't
+            # process it, just forwards it so the orchestrator can use it in
+            # the CoT and qa_agent prompts
+            "bottleneck_features": mo.get("bottleneck_features", {}),
         }
 
-        try:
-            result = await _post_json_async(f"{knowledge_url}/map", payload)
-            return {
-                "knowledge": result.get("knowledge_mapped", {}),
-                "spatial":   result.get("spatial_derived", {}),
-            }
-        except Exception as e:
-            return {"error": f"[knowledge_node] {e}"}
+        with get_tracer().start_as_current_span("graph.knowledge") as span:
+            span.set_attribute("image_id",       state.get("image_id", ""))
+            span.set_attribute("knowledge.organ", routing.get("organ", ""))
+            span.set_attribute("knowledge.label", mo.get("top_label", ""))
+            try:
+                result = await _post_json_async(f"{knowledge_url}/map", payload)
+                km = result.get("knowledge_mapped", {})
+                span.set_attribute("knowledge.severity",       km.get("severity", ""))
+                span.set_attribute("knowledge.severity_level", km.get("severity_level", 0))
+                # spatial was already computed by spatial_node earlier and runs
+                # in parallel; still returned here for backward compatibility
+                # if spatial_node hasn't run (e.g. old AsyncSequentialFallback
+                # or state doesn't have spatial yet).
+                return {
+                    "knowledge": km,
+                    "spatial":   state.get("spatial") or result.get("spatial_derived", {}),
+                }
+            except Exception as e:
+                span.record_exception(e)
+                return {"error": f"[knowledge_node] {e}"}
     return knowledge_node
+
+
+def make_cot_node(llm_client):
+    """
+    CoT reasoning node - runs in parallel with the knowledge node.
+    Does NOT read the mapper's result before reasoning.
+    Output must have the same structure as KnowledgeMapped so they're comparable.
+    """
+    async def cot_reasoning_node(state: OrchestratorState) -> dict:
+        if state.get("error"):
+            return {"cot_result": state.get("cot_result")}
+
+        mo = state.get("model_output") or {}
+        sd = state.get("spatial") or {}
+        routing = state.get("routing") or {}
+        rag_chunks = state.get("rag_chunks") or []
+
+        if not mo:
+            return {"cot_result": None}
+
+        prompt = _build_cot_prompt(
+            top_label=mo.get("top_label", "benign"),
+            confidence=mo.get("confidence", 0.0),
+            all_scores=mo.get("all_scores", {}),
+            spatial=sd,
+            bottleneck=mo.get("bottleneck_features", {}),
+            rag_chunks=rag_chunks,
+            organ=routing.get("organ", "breast"),
+        )
+
+        with get_tracer().start_as_current_span("graph.cot_reasoning") as span:
+            span.set_attribute("image_id",    state.get("image_id", ""))
+            span.set_attribute("cot.organ",   routing.get("organ", ""))
+            span.set_attribute("cot.label",   mo.get("top_label", ""))
+            raw = None
+            try:
+                raw = await asyncio.to_thread(
+                    llm_client.generate, prompt, COT_SYSTEM_PROMPT
+                )
+                clean = raw.strip().replace("```json", "").replace("```", "").strip()
+                parsed = json.loads(clean)
+
+                cot = {
+                    "severity":       str(parsed.get("severity", "incidental")),
+                    "severity_level": int(parsed.get("severity_level", 1)),
+                    "icd10_hint":     str(parsed.get("icd10_hint", "R93.8")),
+                    "risk_category":  str(parsed.get("risk_category", "undetermined")),
+                    "reasoning":      str(parsed.get("reasoning", "")),
+                }
+                span.set_attribute("cot.severity_level", cot["severity_level"])
+            except Exception as e:
+                span.record_exception(e)
+                raw_preview = raw[:200] if raw else ""
+                print(f"[cot_node] Parse error: {e}. Falling back to undetermined.")
+                cot = {
+                    "severity":       "undetermined",
+                    "severity_level": 0,
+                    "icd10_hint":     "R93.8",
+                    "risk_category":  "undetermined",
+                    "reasoning":      f"Parse error: {e}. Raw response: {raw_preview}",
+                }
+
+        return {"cot_result": cot}
+    return cot_reasoning_node
 
 
 def make_rag_node(rag_store):
     """
-    RAG node chay song song voi nhanh vision.
-
-    Query dung question cua user vi vision chua chay xong luc nay.
+    RAG node runs in parallel with the vision branch.
+    Uses the user's question for the query since vision hasn't finished yet.
     """
     async def rag_node(state: OrchestratorState) -> OrchestratorState:
         if state.get("error"):
             return state
+
         question = state.get("question", "")
+        routing = state.get("routing") or {}
+        organ = routing.get("organ")
+
         try:
-            # Wrap sync retrieve() vao thread de tranh block event loop
-            chunks = await asyncio.to_thread(rag_store.retrieve, question, 3) \
-                if rag_store and rag_store.is_ready() else []
-            state["rag_chunks"] = chunks
+            if rag_store and rag_store.is_ready():
+                meta_list = await asyncio.to_thread(
+                    rag_store.retrieve_with_meta, question, 5, organ
+                )
+            else:
+                meta_list = []
+
+            state["rag_chunks"] = [m["chunk"] for m in meta_list]
+            state["rag_meta"] = meta_list
         except Exception as e:
             print(f"[rag_node] Retrieve error: {e}")
             state["rag_chunks"] = []
+            state["rag_meta"] = []
         return state
     return rag_node
 
 
 def make_merge_node():
-    """
-    Doi ca hai nhanh (knowledge va rag) xong roi moi cho qua qa_agent.
-    """
+    """Waits for all three branches (knowledge, cot, rag) before passing to consistency_guard."""
     async def merge_node(state: OrchestratorState) -> OrchestratorState:
-        # Neu co loi tu bat ky nhanh nao, dung lai, khong goi LLM
         if state.get("error"):
             return state
         if not state.get("knowledge"):
-            state["error"] = "[merge_node] knowledge output chua co -- nhanh vision/knowledge bi loi."
+            state["error"] = "[merge_node] knowledge output is missing -- vision/knowledge branch failed."
             return state
+
+        # Once knowledge is available, perform a second retrieve with a richer context.
+        # Does not call the LLM - just concatenates strings from existing fields.
         return state
     return merge_node
 
 
+def make_second_rag_retrieval(rag_store):
+    """
+    Second retrieve after the knowledge result is available (top_label, icd10_hint, organ).
+    Merges with the first retrieve and reranks all candidates.
+    """
+    async def second_retrieve(state: OrchestratorState, question: str) -> tuple:
+        """
+        Returns (all_chunks: list[str], all_meta: list[dict]) after merging and reranking.
+        Called from consistency_guard_node, not a standalone LangGraph node.
+        """
+        if not (rag_store and rag_store.is_ready()):
+            return state.get("rag_chunks") or [], state.get("rag_meta") or []
+
+        km = state.get("knowledge") or {}
+        routing = state.get("routing") or {}
+        organ = routing.get("organ")
+
+        mo = state.get("model_output") or {}
+        top_label = mo.get("top_label", "")
+        icd10 = km.get("icd10_hint", "")
+
+        # Second query concatenates context: question + label + organ + icd10
+        enriched_query = f"{question} {top_label} {organ or ''} {icd10}".strip()
+
+        try:
+            meta2 = await asyncio.to_thread(
+                rag_store.retrieve_with_meta, enriched_query, 5, organ
+            )
+        except Exception as e:
+            print(f"[second_rag] Second retrieve error: {e}")
+            meta2 = []
+
+        # Merge both retrieves, dedup chunks by content
+        existing_meta = state.get("rag_meta") or []
+        existing_texts = {m["chunk"] for m in existing_meta}
+        combined = list(existing_meta)
+        for m in meta2:
+            if m["chunk"] not in existing_texts:
+                combined.append(m)
+                existing_texts.add(m["chunk"])
+
+        # Rerank all candidates, keep top 3
+        reranked = rag_store.rerank(question, combined, top_n=3)
+        chunks = [m["chunk"] for m in reranked]
+        return chunks, reranked
+
+    return second_retrieve
+
+
+def make_consistency_guard_node(rag_store):
+    """
+    New node placed between merge and qa_agent.
+    1. Performs the second RAG retrieve with a richer context.
+    2. Compares mapper and CoT severity_level, sets the consensus flag.
+    3. Separately compares mapper and CoT icd10_hint, sets the icd10_agreement flag.
+
+    consensus and icd10_agreement are two different clinical questions
+    (severity vs disease code) so they are not collapsed into a single flag.
+    """
+    second_retrieve = make_second_rag_retrieval(rag_store)
+
+    async def consistency_guard_node(state: OrchestratorState) -> OrchestratorState:
+        if state.get("error"):
+            return state
+
+        question = state.get("question", "")
+
+        with get_tracer().start_as_current_span("graph.consistency_guard") as span:
+            span.set_attribute("image_id", state.get("image_id", ""))
+
+            final_chunks, final_meta = await second_retrieve(state, question)
+            state["rag_chunks"] = final_chunks
+            state["rag_meta"]   = final_meta
+
+            mapper = state.get("knowledge") or {}
+            mapper_level = mapper.get("severity_level", 0)
+            mapper_icd10 = mapper.get("icd10_hint")
+            cot = state.get("cot_result") or {}
+            cot_level = cot.get("severity_level", 0)
+            cot_icd10 = cot.get("icd10_hint")
+
+            cot_undetermined = cot_level == 0 or cot.get("severity") == "undetermined"
+
+            if cot_undetermined:
+                state["consensus"] = None
+            elif abs(mapper_level - cot_level) <= 1:
+                state["consensus"] = True
+            else:
+                state["consensus"] = False
+
+            if cot_undetermined or mapper_icd10 is None or cot_icd10 is None:
+                state["icd10_agreement"] = None
+            else:
+                state["icd10_agreement"] = mapper_icd10 == cot_icd10
+
+            span.set_attribute("guard.mapper_level", mapper_level)
+            span.set_attribute("guard.cot_level",    cot_level)
+            span.set_attribute("guard.mapper_icd10", mapper_icd10 or "")
+            span.set_attribute("guard.cot_icd10",    cot_icd10 or "")
+            span.set_attribute("guard.consensus",    str(state["consensus"]))
+            span.set_attribute("guard.icd10_agreement", str(state["icd10_agreement"]))
+
+        return state
+    return consistency_guard_node
+
+
 def make_qa_agent_node(llm_client, rag_store):
-    """Sinh bao cao 3 tang tu ket qua vision, knowledge va RAG."""
-    #
+    """Generates the 3-tier report from vision, knowledge, CoT, and RAG results."""
     async def qa_agent_node(state: OrchestratorState) -> OrchestratorState:
         if state.get("error"):
             return state
 
-        routing = state.get("routing", {})
-        mo      = state.get("model_output", {})
-        km      = state.get("knowledge", {})
-        sd      = state.get("spatial", {})
-        rag_chunks = state.get("rag_chunks", [])
+        routing    = state.get("routing") or {}
+        mo         = state.get("model_output") or {}
+        km         = state.get("knowledge") or {}
+        sd         = state.get("spatial") or {}
+        rag_chunks = state.get("rag_chunks") or []
+        rag_meta   = state.get("rag_meta") or []
+        cot_result = state.get("cot_result")
+        consensus  = state.get("consensus")
+        icd10_agreement = state.get("icd10_agreement")
 
         unified = {
             "modality":         routing.get("modality", "ultrasound"),
@@ -438,49 +845,73 @@ def make_qa_agent_node(llm_client, rag_store):
             "coverage_note":    "Model trained on BUSI dataset (benign/malignant/normal only).",
         }
 
-        prompt = _build_report_prompt(unified, state["question"], rag_chunks)
-        try:
-            llm_response = await asyncio.to_thread(
-                llm_client.generate, prompt, SYSTEM_PROMPT
-            )
-        except Exception as e:
-            llm_response = f"[LLM unavailable: {e}]"
+        prompt = _build_report_prompt(
+            unified, state["question"], rag_chunks, cot_result, consensus, icd10_agreement
+        )
+
+        with get_tracer().start_as_current_span("graph.qa_agent") as span:
+            span.set_attribute("image_id",          state.get("image_id", ""))
+            span.set_attribute("qa.consensus",       str(consensus))
+            span.set_attribute("qa.icd10_agreement", str(icd10_agreement))
+            span.set_attribute("qa.rag_chunks_used", len(rag_chunks))
+            try:
+                llm_response = await asyncio.to_thread(
+                    llm_client.generate, prompt, SYSTEM_PROMPT
+                )
+            except Exception as e:
+                span.record_exception(e)
+                llm_response = f"[LLM unavailable: {e}]"
 
         tier2, tier3 = _parse_tiers(llm_response)
 
+        mapper_icd10 = km.get("icd10_hint", "unknown")
+        if icd10_agreement is False:
+            cot_icd10 = (cot_result or {}).get("icd10_hint", "unknown")
+            tier1_icd10_hint = f"{mapper_icd10} / {cot_icd10}"
+        else:
+            tier1_icd10_hint = mapper_icd10
+
         tier1 = {
-            "modality":        routing.get("modality", "ultrasound"),
-            "organ":           routing.get("organ", "breast"),
-            "label":           mo.get("top_label", "unknown"),
-            "confidence":      mo.get("confidence", 0.0),
-            "risk_category":   km.get("risk_category", "unknown"),
-            "severity":        km.get("severity", "unknown"),
-            "severity_level":  km.get("severity_level", 1),
-            "icd10_hint":      km.get("icd10_hint", "unknown"),
-            "location_quadrant": sd.get("location_quadrant", "unknown"),
-            "bbox":            sd.get("bbox", [0, 0, 0, 0]),
-            "area_cm2":        sd.get("area_cm2", 0.0),
-            "aspect_ratio":    sd.get("aspect_ratio", 1.0),
-            "circularity":     sd.get("circularity", 1.0),
+            "modality":           routing.get("modality", "ultrasound"),
+            "organ":              routing.get("organ", "breast"),
+            "label":              mo.get("top_label", "unknown"),
+            "confidence":         mo.get("confidence", 0.0),
+            "risk_category":      km.get("risk_category", "unknown"),
+            "severity":           km.get("severity", "unknown"),
+            "severity_level":     km.get("severity_level", 1),
+            "icd10_hint":         tier1_icd10_hint,
+            "location_quadrant":  sd.get("location_quadrant", "unknown"),
+            "bbox":               sd.get("bbox", [0, 0, 0, 0]),
+            "area_cm2":           sd.get("area_cm2", 0.0),
+            "aspect_ratio":       sd.get("aspect_ratio", 1.0),
+            "circularity":        sd.get("circularity", 1.0),
             "confidence_calibration_note": km.get("confidence_calibration_note"),
-            # Copy hint fields tu routing vao tier1 de UI hien thi banner
             "hint_conflict":          routing.get("hint_conflict", False),
             "hint_resolution_note":   routing.get("hint_resolution_note"),
+            "icd10_agreement":        icd10_agreement,
         }
+
+        rag_sources = [
+            {"file": m.get("source_file", "unknown"), "page": m.get("page_number", 0)}
+            for m in rag_meta
+        ]
 
         state["report"] = {
             "image_id":                        state["image_id"],
             "tier_1_structured":               tier1,
             "tier_2_radiological_description": tier2,
             "tier_3_diagnostic_suggestion":    tier3,
-            "rag_sources": [f"chunk_{i}" for i in range(len(rag_chunks))],
+            "rag_sources":                     rag_sources,
             "rag_disabled_warning": (
                 None if (rag_store and rag_store.is_ready()) else
                 "RAG context not available -- report generated from classification "
                 "label and hardcoded mapping only, without clinical guideline retrieval."
             ),
-            # rag_chunks duoc embed trong report de main.py doc cho /chat cache
-            "_rag_chunks_internal": rag_chunks,
+            "mapper_result":          km,
+            "cot_result":             cot_result,
+            "consensus":              consensus,
+            "icd10_agreement":        icd10_agreement,
+            "_rag_chunks_internal":   rag_chunks,
         }
         return state
     return qa_agent_node
@@ -488,8 +919,8 @@ def make_qa_agent_node(llm_client, rag_store):
 
 def _parse_tiers(llm_text: str) -> tuple:
     """
-    Parse LLM response -> (tier2_text, tier3_text).
-    Tim markers 'TIER 2' va 'TIER 3', fallback split neu khong tim thay.
+    Parse the LLM response -> (tier2_text, tier3_text).
+    Looks for 'TIER 2' and 'TIER 3' markers, falls back to a midpoint split if not found.
     """
     text = llm_text.strip()
     t2_start = -1
@@ -533,11 +964,11 @@ def _parse_tiers(llm_text: str) -> tuple:
     )
 
 
-# Xay dung va compile graph
+# Building and compiling the graph
 
 def build_graph(services_cfg: dict, llm_client, rag_store, registry=None):
     """
-    Build va compile LangGraph pipeline voi fan-out/fan-in that su.
+    Build and compile the LangGraph pipeline with real fan-out/fan-in.
 
     Args:
         services_cfg: {
@@ -547,92 +978,175 @@ def build_graph(services_cfg: dict, llm_client, rag_store, registry=None):
         }
         llm_client:  BaseLLMClient instance
         rag_store:   FAISSStore instance
-        registry:    ModuleRegistry instance, doc that tu module_registry.yaml.
+        registry:    ModuleRegistry instance, reads facts from module_registry.yaml.
 
-    Returns compiled async graph (hoac AsyncSequentialFallback neu langgraph khong co).
+    Returns a compiled async graph (or AsyncSequentialFallback if langgraph is unavailable).
     """
     router_url    = services_cfg.get("router_url",    "http://router:8001")
     vision_url    = services_cfg.get("vision_url",    "http://vision:8002")
     knowledge_url = services_cfg.get("knowledge_url", "http://knowledge:8003")
 
-    route_node     = make_route_node(router_url)
-    vision_node    = make_vision_node(vision_url, registry=registry)
-    knowledge_node = make_knowledge_node(knowledge_url)
-    rag_node       = make_rag_node(rag_store)
-    merge_node     = make_merge_node()
-    qa_agent_node  = make_qa_agent_node(llm_client, rag_store)
+    route_node              = make_route_node(router_url)
+    vision_node             = make_vision_node(vision_url, registry=registry)
+    spatial_node            = make_spatial_node(knowledge_url)
+    knowledge_node          = make_knowledge_node(knowledge_url)
+    cot_node                = make_cot_node(llm_client)
+    rag_node                = make_rag_node(rag_store)
+    merge_node              = make_merge_node()
+    consistency_guard_node  = make_consistency_guard_node(rag_store)
+    qa_agent_node           = make_qa_agent_node(llm_client, rag_store)
 
     if LANGGRAPH_AVAILABLE:
         g = StateGraph(OrchestratorState)
-        g.add_node("route",        route_node)
-        g.add_node("vision",       vision_node)
-        g.add_node("knowledge",    knowledge_node)
-        g.add_node("rag_retrieve", rag_node)
-        g.add_node("merge",        merge_node)
-        g.add_node("qa_agent",     qa_agent_node)
+        g.add_node("route",             route_node)
+        g.add_node("vision",            vision_node)
+        g.add_node("spatial",           spatial_node)
+        g.add_node("knowledge",         knowledge_node)
+        g.add_node("cot_reasoning",     cot_node)
+        g.add_node("rag_retrieve",      rag_node)
+        g.add_node("merge",             merge_node)
+        g.add_node("consistency_guard", consistency_guard_node)
+        g.add_node("qa_agent",          qa_agent_node)
 
         g.set_entry_point("route")
-        # Fan-out: vision va rag chay song song sau route
-        g.add_edge("route",        "vision")
-        g.add_edge("route",        "rag_retrieve")
-        g.add_edge("vision",       "knowledge")
-        # Fan-in: merge chi chay sau khi CA HAI nhanh knowledge va rag xong
-        g.add_edge(["knowledge", "rag_retrieve"], "merge")
-        g.add_edge("merge",        "qa_agent")
-        g.add_edge("qa_agent",     END)
+
+        # Fan-out: vision and rag run in parallel after route
+        g.add_edge("route",   "vision")
+        g.add_edge("route",   "rag_retrieve")
+        # spatial runs right after vision, BEFORE fanning out to knowledge/cot_reasoning,
+        # so both branches see the real spatial_derived data (avoids the old race
+        # condition -- cot_reasoning used to always read spatial={} because it ran
+        # in parallel with knowledge_node, the only node computing spatial at the time).
+        g.add_edge("vision",  "spatial")
+        g.add_edge("spatial", "knowledge")
+        # CoT runs after spatial (needs model_output + spatial) but in parallel with knowledge
+        g.add_edge("spatial", "cot_reasoning")
+
+        # Fan-in: merge waits for ALL THREE branches
+        g.add_edge(["knowledge", "cot_reasoning", "rag_retrieve"], "merge")
+        g.add_edge("merge",             "consistency_guard")
+        g.add_edge("consistency_guard", "qa_agent")
+        g.add_edge("qa_agent",          END)
 
         return g.compile()
     else:
         return AsyncSequentialFallback(
-            image_nodes=[route_node, vision_node, knowledge_node],
+            image_nodes=[route_node, vision_node, spatial_node, knowledge_node],
+            cot_node=cot_node,
             rag_node=rag_node,
             merge_node=merge_node,
+            consistency_guard_node=consistency_guard_node,
             qa_agent_node=qa_agent_node,
         )
 
 
 class AsyncSequentialFallback:
     """
-    Fallback khi langgraph khong install.
-    Mo phong fan-out bang asyncio.gather cho 2 nhanh (vision + rag),
-    dam bao test pass ca khi langgraph thieu trong moi truong CI nhe.
+    Fallback when langgraph is not installed.
+    Mirrors build_graph's real edges exactly: route -> vision -> spatial ->
+    {knowledge, cot_reasoning} run in parallel (both depend only on spatial's
+    output, not on each other) -> merge waits for knowledge + cot_reasoning +
+    rag_retrieve -> consistency_guard -> qa_agent.
+
+    IMPORTANT: route_node, vision_node, spatial_node, knowledge_node, and
+    cot_node all return a PARTIAL dict (e.g. {"routing": ...} or
+    {"error": ...}), not the full state -- this is the real LangGraph
+    contract, since LangGraph merges partial returns into shared state via
+    the Annotated[..., reducer] fields on OrchestratorState. This fallback
+    must replicate that merging manually (state.update(partial)) instead of
+    replacing state outright, or keys like image_bytes/question/image_id
+    silently disappear after the first node runs. rag_node, merge_node,
+    consistency_guard_node, and qa_agent_node are the exception -- they take
+    and return the full state directly (see their signatures in this file).
+
+    cot_node MUST run on a state snapshot taken before knowledge_node executes,
+    not after -- otherwise CoT would see the mapper's result (severity,
+    icd10_hint) before reasoning, defeating the whole point of comparing two
+    independent assessments (see make_cot_node's docstring).
     """
 
-    def __init__(self, image_nodes, rag_node, merge_node, qa_agent_node):
-        self.image_nodes = image_nodes      # [route, vision, knowledge]
+    def __init__(
+        self,
+        image_nodes,
+        cot_node,
+        rag_node,
+        merge_node,
+        consistency_guard_node,
+        qa_agent_node,
+    ):
+        self.image_nodes = image_nodes          # [route, vision, spatial, knowledge]
+        self.cot_node = cot_node
         self.rag_node = rag_node
         self.merge_node = merge_node
+        self.consistency_guard_node = consistency_guard_node
         self.qa_agent_node = qa_agent_node
 
     async def ainvoke(self, state: dict) -> dict:
-        # Chay route truoc, roi fan-out vision va rag
-        state = await self.image_nodes[0](state)
+        import copy
+
+        # Step 1: route -- merge its partial dict into state, don't replace state.
+        # Indexed (not destructured) so an error-path test can supply a
+        # shorter image_nodes list and still short-circuit safely below,
+        # without ever needing to unpack the rest of the list.
+        route_node = self.image_nodes[0]
+        state.update(await route_node(state))
         if state.get("error"):
             return state
 
-        import copy
-        state_for_rag = copy.copy(state)
+        vision_node, spatial_node, knowledge_node = self.image_nodes[1:]
 
-        async def run_image_branch(s):
-            for node in self.image_nodes[1:]:
-                s = await node(s)
-            return s
-
-        state, state_for_rag = await asyncio.gather(
-            run_image_branch(state),
+        # Step 2: vision and rag run in parallel after route
+        state_for_rag = copy.deepcopy(state)
+        vision_partial, rag_result = await asyncio.gather(
+            vision_node(state),
             self.rag_node(state_for_rag),
         )
+        state.update(vision_partial)
+        state["rag_chunks"] = rag_result.get("rag_chunks", [])
+        state["rag_meta"]   = rag_result.get("rag_meta", [])
 
-        state["rag_chunks"] = state_for_rag.get("rag_chunks", [])
+        if state.get("error"):
+            return state
 
+        # Step 3: spatial runs right after vision, before fanning out to
+        # knowledge/cot_reasoning, so both see the real spatial_derived data
+        state.update(await spatial_node(state))
+        if state.get("error"):
+            return state
+
+        # Step 4: knowledge and cot_reasoning run in parallel, each on its own
+        # deepcopy of the SAME pre-knowledge state -- cot_node must never see
+        # state["knowledge"] before it finishes reasoning.
+        state_for_cot = copy.deepcopy(state)
+        knowledge_partial, cot_partial = await asyncio.gather(
+            knowledge_node(state),
+            self.cot_node(state_for_cot),
+        )
+        state.update(knowledge_partial)
+        if not state.get("error"):
+            state["cot_result"] = cot_partial.get("cot_result")
+
+        if state.get("error"):
+            return state
+
+        # Step 5: merge (fan-in for knowledge + cot_reasoning + rag_retrieve)
+        # merge_node/consistency_guard_node/qa_agent_node take and return the
+        # full state directly, unlike the partial-dict nodes above.
         state = await self.merge_node(state)
         if state.get("error"):
             return state
+
+        # Step 6: consistency_guard (second RAG + compare)
+        state = await self.consistency_guard_node(state)
+        if state.get("error"):
+            return state
+
+        # Step 7: qa_agent
         state = await self.qa_agent_node(state)
         return state
 
 
-# Ham chay pipeline tu ngoai
+# External pipeline entry points
 
 async def run_pipeline_async(
     graph,
@@ -643,10 +1157,10 @@ async def run_pipeline_async(
     organ_hint: str = None,
 ) -> dict:
     """
-    Chay toan bo pipeline tu bytes -> ReportOutput dict (async).
+    Run the entire pipeline from bytes -> ReportOutput dict (async).
 
-    Dung cho FastAPI async handler -- khong goi asyncio.run() long trong
-    context da async san (se loi runtime).
+    Used by the FastAPI async handler - do not call asyncio.run() nested
+    inside an already-async context (will raise a runtime error).
     """
     if image_id is None:
         image_id = uuid.uuid4().hex[:12]
@@ -661,15 +1175,16 @@ async def run_pipeline_async(
         "model_output":  None,
         "knowledge":     None,
         "spatial":       None,
+        "cot_result":    None,
         "rag_chunks":    [],
+        "rag_meta":      [],
+        "consensus":     None,
+        "icd10_agreement": None,
         "report":        None,
         "error":         None,
     }
 
-    if hasattr(graph, "ainvoke"):
-        final_state = await graph.ainvoke(initial_state)
-    else:
-        final_state = await graph.ainvoke(initial_state)
+    final_state = await graph.ainvoke(initial_state)
 
     if final_state.get("error"):
         raise RuntimeError(final_state["error"])
@@ -686,8 +1201,8 @@ def run_pipeline(
     organ_hint: str = None,
 ) -> dict:
     """
-    Phien ban sync cua run_pipeline_async -- chi dung khi chay ngoai
-    FastAPI (vd. script thu cong). Trong FastAPI, dung run_pipeline_async.
+    Sync version of run_pipeline_async - only used outside FastAPI
+    (e.g. a manual script). Inside FastAPI, use run_pipeline_async.
     """
     return asyncio.run(run_pipeline_async(
         graph, image_bytes, question, image_id, modality_hint, organ_hint

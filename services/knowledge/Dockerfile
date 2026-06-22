@@ -13,12 +13,16 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY shared/ ./shared/
 COPY services/__init__.py ./services/__init__.py
 COPY services/knowledge/ ./services/knowledge/
-# Copy postprocess.py từ vision cho cả 2 organ — knowledge chỉ cần spatial features, KHÔNG cần model
+# Copy postprocess.py from vision for both organs -- knowledge only needs spatial features, NOT the model
 COPY services/vision/__init__.py ./services/vision/__init__.py
 COPY services/vision/us_breast/postprocess.py ./services/vision/us_breast/postprocess.py
 COPY services/vision/us_breast/__init__knowledge.py ./services/vision/us_breast/__init__.py
 COPY services/vision/us_thyroid/postprocess.py ./services/vision/us_thyroid/postprocess.py
 COPY services/vision/us_thyroid/__init__knowledge.py ./services/vision/us_thyroid/__init__.py
+
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8003
 

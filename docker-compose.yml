@@ -1,14 +1,56 @@
 services:
 
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # GPU passthrough (uncomment if running on a host with an NVIDIA GPU + nvidia-container-toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    env_file: .env
+    entrypoint: >
+      sh -c "
+        echo '[ollama-pull] Waiting for Ollama daemon...';
+        until ollama list > /dev/null 2>&1; do sleep 2; done;
+        echo '[ollama-pull] Pulling model: $${OLLAMA_MODEL:-phi4-mini}';
+        ollama pull $${OLLAMA_MODEL:-phi4-mini};
+        echo '[ollama-pull] Done.';
+      "
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
   router:
     build:
       context: .
       dockerfile: services/router/Dockerfile
-    ports:
-      - "${ROUTER_PORT:-8001}:8001"
     env_file: .env
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
     volumes:
       - ./models/checkpoints:/app/models/checkpoints:ro
+    depends_on:
+      - jaeger
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8001/health"]
       interval: 30s
@@ -19,12 +61,14 @@ services:
     build:
       context: .
       dockerfile: services/vision/Dockerfile
-    ports:
-      - "${VISION_PORT:-8002}:8002"
     env_file: .env
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
     volumes:
       - ./models/checkpoints:/app/models/checkpoints:ro
       - ./data:/app/data:ro
+    depends_on:
+      - jaeger
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8002/health"]
       interval: 30s
@@ -35,9 +79,11 @@ services:
     build:
       context: .
       dockerfile: services/knowledge/Dockerfile
-    ports:
-      - "${KNOWLEDGE_PORT:-8003}:8003"
     env_file: .env
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
+    depends_on:
+      - jaeger
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8003/health"]
       interval: 30s
@@ -51,6 +97,8 @@ services:
     ports:
       - "${ORCHESTRATOR_PORT:-8000}:8000"
     env_file: .env
+    environment:
+      - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
     volumes:
       - ./services/orchestrator/rag/docs:/app/services/orchestrator/rag/docs:ro
       - ./services/orchestrator/rag/vectordb:/app/services/orchestrator/rag/vectordb
@@ -59,6 +107,9 @@ services:
       - router
       - vision
       - knowledge
+      - jaeger
+      - ollama
+      - ollama-pull     
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -74,3 +125,58 @@ services:
     env_file: .env
     depends_on:
       - orchestrator
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.57
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:16686"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  prometheus:
+    image: prom/prometheus:v2.51.2
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.retention.time=7d"
+    depends_on:
+      - router
+      - vision
+      - knowledge
+      - orchestrator
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:10.4.2
+    ports:
+      - "3000:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  grafana_data:
+  ollama_data:

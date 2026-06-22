@@ -1,14 +1,14 @@
 """
 services/vision/us_thyroid/model.py
 ======================================
-Load checkpoint + inference wrapper cho UNet_MTL (thyroid).
+Checkpoint loading + inference wrapper for UNet_MTL (thyroid).
 
 Public API:
     load_model(checkpoint_path, device)  -> (UNet_MTL, Config)
     run_inference(model, cfg, image_bytes) -> dict
 
-Output dict có cùng schema với us_breast - main.py có thể dùng
-cùng ModelOutput Pydantic schema mà không cần thay đổi.
+The output dict has the same schema as us_breast - main.py can use
+the same ModelOutput Pydantic schema without any changes.
 """
 
 import os
@@ -22,20 +22,21 @@ from PIL import Image
 import io
 
 from .arch import Config, UNet_MTL
+from shared.image_validation import check_image_dimensions, ImageValidationError
 
 
-# Load model tu checkpoint
+# Load the model from a checkpoint
 
 def load_model(checkpoint_path: str, device: str = None):
     """
-    Load UNet_MTL (thyroid) từ checkpoint .pt file.
+    Load UNet_MTL (thyroid) from a checkpoint .pt file.
 
     Args:
-        checkpoint_path: path tới mtl_effnet_fc_conv_thyroid.pt
+        checkpoint_path: path to mtl_effnet_fc_conv_thyroid.pt
         device:          'cuda' | 'cpu' | None (auto-detect)
 
     Returns:
-        (model, cfg) - model ở eval mode, cfg chứa MEAN/STD/IDX_TO_CLASS
+        (model, cfg) - the model in eval mode, cfg holds MEAN/STD/IDX_TO_CLASS
     """
     if device is None:
         device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -51,21 +52,21 @@ def load_model(checkpoint_path: str, device: str = None):
 
     if not os.path.exists(checkpoint_path):
         raise FileNotFoundError(
-            f"Checkpoint không tìm thấy: {checkpoint_path}\n"
-            "Đặt file mtl_effnet_fc_conv_thyroid.pt vào models/checkpoints/"
+            f"Checkpoint not found: {checkpoint_path}\n"
+            "Place the mtl_effnet_fc_conv_thyroid.pt file in models/checkpoints/"
         )
 
     state_dict = torch.load(checkpoint_path, map_location=device)
     model.load_state_dict(state_dict)
     model.eval()
-    print(f"[vision/us_thyroid] Loaded checkpoint từ {checkpoint_path} on {device}")
+    print(f"[vision/us_thyroid] Loaded checkpoint from {checkpoint_path} on {device}")
     return model, cfg
 
 
-# Tien xu ly anh dau vao
+# Input image preprocessing
 
 def _build_transform(cfg: Config) -> transforms.Compose:
-    """Transform inference, dung TN3K mean/std (khac ImageNet)."""
+    """Inference transform, uses TN3K mean/std (different from ImageNet)."""
     return transforms.Compose([
         transforms.Resize((cfg.IMG_SIZE, cfg.IMG_SIZE)),
         transforms.ToTensor(),
@@ -78,13 +79,16 @@ def _preprocess(image_bytes: bytes, cfg: Config) -> tuple:
     Decode bytes -> PIL RGB -> tensor (1, 3, H, W).
 
     Returns:
-        tensor:        preprocessed input cho model
-        original_size: (H, W) ảnh gốc để upsample mask về
+        tensor:        preprocessed input for the model
+        original_size: (H, W) of the original image, to upsample the mask back to
     """
     img_array    = np.frombuffer(image_bytes, dtype=np.uint8)
     img_bgr      = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
+    if img_bgr is None:
+        raise ValueError("Could not decode the image. Check the format (PNG/JPG).")
     img_rgb      = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     original_size = (img_rgb.shape[0], img_rgb.shape[1])   # (H, W)
+    check_image_dimensions(width=original_size[1], height=original_size[0])
 
     pil_img   = Image.fromarray(img_rgb)
     transform = _build_transform(cfg)
@@ -92,16 +96,16 @@ def _preprocess(image_bytes: bytes, cfg: Config) -> tuple:
     return tensor, original_size
 
 
-# Bottleneck feature extraction (giống us_breast)
+# Bottleneck feature extraction (same as us_breast)
 
 def extract_bottleneck_summary(bottleneck_tensor: torch.Tensor) -> dict:
     """
-    Serialize bottleneck tensor (1, 448, H, W) thành text-readable dict.
+    Serializes the bottleneck tensor (1, 448, H, W) into a text-readable dict.
 
     Returns:
         activation_energy:       float
         top_channel_activations: list[float] - top-10 channel means
-        attention_hotspot_grid:  [row, col] - vị trí model tập trung nhất
+        attention_hotspot_grid:  [row, col] - the position the model focuses on most
     """
     with torch.no_grad():
         feat         = bottleneck_tensor.squeeze(0)          # (448, H, W)
@@ -120,7 +124,7 @@ def extract_bottleneck_summary(bottleneck_tensor: torch.Tensor) -> dict:
     }
 
 
-# Ham inference chinh
+# Main inference function
 
 def run_inference(
     model: UNet_MTL,
@@ -130,14 +134,15 @@ def run_inference(
     """
     End-to-end inference: bytes -> mask (base64 PNG) + classification + bottleneck.
 
-    Output dict có cùng key schema với us_breast - tương thích ModelOutput schema.
+    The output dict has the same key schema as us_breast - compatible with the
+    ModelOutput schema.
 
     Args:
         model:       loaded UNet_MTL (eval mode)
-        cfg:         Config instance từ load_model
-        image_bytes: raw bytes của ảnh upload
+        cfg:         Config instance from load_model
+        image_bytes: raw bytes of the uploaded image
 
-    Returns dict:
+    Returns a dict:
         top_label, confidence, all_scores,
         mask_png_base64, bottleneck_features, filtered_findings, original_size
     """
@@ -149,7 +154,7 @@ def run_inference(
     with torch.no_grad():
         seg_output, cls_output, bottleneck_out = model(tensor)
 
-    # Softmax lay top label
+    # Softmax to get the top label
     probs      = F.softmax(cls_output, dim=1).squeeze(0)    # (2,)
     all_scores = {
         cls: round(float(probs[idx]), 4)
@@ -159,7 +164,7 @@ def run_inference(
     top_label  = cfg.IDX_TO_CLASS[top_idx]
     confidence = round(float(probs[top_idx]), 4)
 
-    # Upsample mask ve kich thuoc anh goc
+    # Upsample the mask back to the original image size
     mask_upsampled = F.interpolate(
         seg_output,
         size=original_size,
@@ -168,16 +173,16 @@ def run_inference(
     ).squeeze(0).squeeze(0)                                  # (H_orig, W_orig)
     mask_np = (mask_upsampled.cpu().numpy() > 0.5).astype(np.uint8) * 255
 
-    # Encode mask thanh PNG base64 (khong ghi file)
+    # Encode the mask as base64 PNG (no file written)
     ok, mask_png_bytes = cv2.imencode('.png', mask_np)
     if not ok:
-        raise RuntimeError('Không encode được mask thành PNG.')
+        raise RuntimeError('Could not encode the mask as PNG.')
     mask_png_base64 = base64.b64encode(mask_png_bytes.tobytes()).decode('ascii')
 
-    # Trich xuat bottleneck features
+    # Extract bottleneck features
     bottleneck_features = extract_bottleneck_summary(bottleneck_out.cpu())
 
-    # Labels co confidence < 0.1 duoc filter ra
+    # Labels with confidence < 0.1 are filtered out
     filtered_findings = [
         {'label': cls, 'confidence': score, 'reason': 'below threshold 0.1'}
         for cls, score in all_scores.items()

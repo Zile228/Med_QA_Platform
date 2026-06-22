@@ -1,17 +1,17 @@
 """
 services/vision/us_breast/arch.py
 ==================================
-Model architecture classes - copied từ busi-architecture-full-implementation.ipynb.
+Model architecture classes - copied from busi-architecture-full-implementation.ipynb.
 
-Chỉ giữ lại những gì cần cho POC (checkpoint mtl_effnet_fc_conv.pt):
+Only keeps what is needed for the POC (checkpoint mtl_effnet_fc_conv.pt):
   - Config
   - ConvBlock
-  - UNet_MTL      <- model chính, dùng cho inference
-  - UNet_Segmentation  <- giữ lại để tham chiếu, không dùng trong POC
+  - UNet_MTL      <- main model, used for inference
+  - UNet_Segmentation  <- kept for reference, not used in the POC
 
-KHÔNG copy:
-  - CapsuleLayer, CapsuleNetwork  (cfg.CLASSIFICATION_HEAD='capsnet' - không dùng)
-  - DeformableConvBlock           (cfg.USE_Deform=False - không dùng)
+NOT copied:
+  - CapsuleLayer, CapsuleNetwork  (cfg.CLASSIFICATION_HEAD='capsnet' - unused)
+  - DeformableConvBlock           (cfg.USE_Deform=False - unused)
   - Dataset/transform classes     (training only)
 """
 
@@ -24,32 +24,32 @@ import timm
 
 class Config:
     """
-    Centralized config. Inference chỉ cần các field bên dưới.
-    Training fields (EPOCHS, BATCH_SIZE, ...) giữ lại cho reference.
+    Centralized config. Inference only needs the fields below.
+    Training fields (EPOCHS, BATCH_SIZE, ...) are kept for reference.
     """
     # Architecture
     MODEL_TYPE = 'multitask'
     BACKBONE = 'efficientnet_b4'
     NUM_CLASSES = 3
     USE_Deform = False
-    CLASSIFICATION_HEAD = 'fc'   # 'fc' | 'capsnet' - POC dùng 'fc'
+    CLASSIFICATION_HEAD = 'fc'   # 'fc' | 'capsnet' - POC uses 'fc'
 
     # Inference
     IMG_SIZE = 256
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-    # Tham so training (khong dung luc inference)
+    # Training parameters (not used at inference time)
     BATCH_SIZE = 16
     EPOCHS = 100
     LEARNING_RATE = 1e-4
     TEST_RATIO = 0.2
     SEED = 42
 
-    # Gia tri chuan hoa tinh tu BUSI training set (khac ImageNet)
-    MEAN = [0.2720, 0.2720, 0.2720]   # grayscale-like: 3 channels gần bằng nhau
+    # Normalization values computed from the BUSI training set (differs from ImageNet)
+    MEAN = [0.2720, 0.2720, 0.2720]   # grayscale-like: 3 channels nearly equal
     STD  = [0.1890, 0.1890, 0.1890]
 
-    # Anh xa class theo thu tu alphabet cua BUSI
+    # Class mapping following BUSI's alphabetical order
     IDX_TO_CLASS = {0: "benign", 1: "malignant", 2: "normal"}
     CLASS_TO_IDX = {"benign": 0, "malignant": 1, "normal": 2}
 
@@ -57,7 +57,7 @@ class Config:
 
 class ConvBlock(nn.Module):
     """
-    Double conv block dùng trong decoder path của UNet.
+    Double conv block used in the UNet decoder path.
     Conv3x3 -> BN -> ReLU -> Conv3x3 -> BN -> ReLU
     """
     def __init__(self, in_channels: int, out_channels: int):
@@ -79,13 +79,13 @@ class ConvBlock(nn.Module):
 
 class UNet_MTL(nn.Module):
     """
-    Multi-task UNet với EfficientNet-B4 encoder.
+    Multi-task UNet with an EfficientNet-B4 encoder.
 
-    Forward pass trả về (seg_output, cls_output, bottleneck_out):
+    Forward pass returns (seg_output, cls_output, bottleneck_out):
       - seg_output:    (B, 1, H, W)   - sigmoid mask [0, 1]
-      - cls_output:    (B, NUM_CLASSES) - raw logits (trước softmax)
-      - bottleneck_out: (B, 448, 7, 7) - feature map từ đáy encoder
-                        dùng để extract bottleneck_features cho LLM
+      - cls_output:    (B, NUM_CLASSES) - raw logits (before softmax)
+      - bottleneck_out: (B, 448, 7, 7) - feature map from the bottom of the
+                        encoder, used to extract bottleneck_features for the LLM
 
     EfficientNet-B4 encoder channels: [24, 32, 56, 160, 448]
     """
@@ -94,7 +94,7 @@ class UNet_MTL(nn.Module):
         super(UNet_MTL, self).__init__()
         self.cfg = cfg
 
-        # EfficientNet-B4 encoder, tra ve 5 feature scale
+        # EfficientNet-B4 encoder, returns 5 feature scales
         self.backbone = timm.create_model(
             cfg.BACKBONE, pretrained=False, features_only=True
         )
@@ -115,7 +115,7 @@ class UNet_MTL(nn.Module):
         self.upconv1 = nn.ConvTranspose2d(backbone_channels[1], backbone_channels[0], kernel_size=2, stride=2)
         self.dec1    = conv_block(backbone_channels[0] + backbone_channels[0], backbone_channels[0])
 
-        # Segmentation head va classification head (FC)
+        # Segmentation head and classification head (FC)
         self.seg_head = nn.Conv2d(backbone_channels[0], 1, kernel_size=1)
         self.cls_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -139,7 +139,7 @@ class UNet_MTL(nn.Module):
         features = self.backbone(x)
         enc1_out, enc2_out, enc3_out, enc4_out, bottleneck_out = features
 
-        # Classification tu bottleneck
+        # Classification from the bottleneck
         cls_output = self.cls_head(bottleneck_out)
 
         d4 = self.upconv4(bottleneck_out)
@@ -158,17 +158,17 @@ class UNet_MTL(nn.Module):
         d1 = torch.cat([d1, enc1_out], dim=1)
         d1 = self.dec1(d1)
 
-        # Upsample mask ve kich thuoc anh goc
+        # Upsample the mask back to the original image size
         d1 = F.interpolate(d1, size=x.shape[2:], mode='bilinear', align_corners=False)
         seg_output = torch.sigmoid(self.seg_head(d1))
 
         return seg_output, cls_output, bottleneck_out
 
 
-# UNet_Segmentation - Segmentation only (reference, không dùng POC)
+# UNet_Segmentation - Segmentation only (reference, not used in the POC)
 
 class UNet_Segmentation(nn.Module):
-    """Segmentation-only UNet. Giu lai de tham chieu, khong dung cho inference."""
+    """Segmentation-only UNet. Kept for reference, not used for inference."""
 
     def __init__(self, cfg: Config):
         super(UNet_Segmentation, self).__init__()

@@ -1,6 +1,6 @@
 """
-Test cho services/knowledge/mapper.py - dispatch postprocess theo organ
-và rà soát hardcode 1 organ ẩn ở nơi khác trong services/.
+Tests for services/knowledge/mapper.py - dispatch postprocess by organ
+and audit for hidden single-organ hardcoding elsewhere in services/.
 """
 
 import base64
@@ -18,7 +18,7 @@ from services.knowledge import mapper
 
 
 def _make_mask_base64(blob_xy, size=(400, 400)):
-    """Tạo 1 mask PNG base64 với 1 blob tròn tại vị trí blob_xy (cx, cy)."""
+    """Creates a base64 PNG mask with a circular blob at position blob_xy (cx, cy)."""
     h, w = size
     mask = np.zeros((h, w), dtype=np.uint8)
     cv2.circle(mask, blob_xy, 20, 255, -1)
@@ -82,7 +82,7 @@ def test_derive_spatial_uses_thyroid_postprocess_for_thyroid_organ(monkeypatch):
 
 
 def test_derive_spatial_thyroid_location_quadrant_values():
-    # Blob ở x=50 trong ảnh rộng 400 -> x < W*0.35 (140) -> left-lobe
+    # Blob at x=50 in a 400-wide image -> x < W*0.35 (140) -> left-lobe
     result = mapper.derive_spatial(
         mask_png_base64=_make_mask_base64((50, 200)),
         original_size=(400, 400),
@@ -115,8 +115,8 @@ def test_knowledge_dockerfile_includes_thyroid_postprocess():
 
 def test_no_hardcoded_us_breast_import_outside_own_module():
     """
-    Rà soát mục 0.2/2.3 - mọi import trực tiếp symbol từ us_breast bên ngoài
-    chính module us_breast phải có nhánh us_thyroid tương ứng song song.
+    Audit for item 0.2/2.3 - every direct symbol import from us_breast outside
+    the us_breast module itself must have a corresponding parallel us_thyroid branch.
     """
     repo_root = os.path.join(os.path.dirname(__file__), "..")
     out = subprocess.run(
@@ -133,10 +133,10 @@ def test_no_hardcoded_us_breast_import_outside_own_module():
             continue
         offending.append(rel)
 
-    # Mỗi file có hardcode us_breast phải đồng thời có dòng us_thyroid tương ứng
+    # Every file that hardcodes us_breast must also have a corresponding us_thyroid line
     for rel in set(offending):
         with open(os.path.join(repo_root, rel), encoding="utf-8") as f:
             file_content = f.read()
         assert "us_thyroid" in file_content, (
-            f"{rel} import us_breast nhưng không có nhánh us_thyroid song song"
+            f"{rel} imports us_breast but has no parallel us_thyroid branch"
         )

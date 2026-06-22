@@ -1,0 +1,133 @@
+{
+  "title": "Med-Platform Overview",
+  "uid": "med-platform-v1",
+  "schemaVersion": 38,
+  "refresh": "30s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Analyze Latency P50 / P95 (orchestrator)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(orchestrator_analyze_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(orchestrator_analyze_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "P95"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Vision Inference Latency P95 (by organ)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(vision_inference_duration_seconds_bucket[5m])) by (le, organ))",
+          "legendFormat": "{{organ}} P95"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Request Rate (analyze / min)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(orchestrator_analyze_requests_total[1m])) * 60",
+          "legendFormat": "req/min"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "OOD Rejection Rate",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(orchestrator_ood_rejections_total[5m])) / sum(rate(orchestrator_analyze_requests_total[5m]))",
+          "legendFormat": "OOD rate"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Consensus False Rate (mapper vs CoT bat dong)",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(orchestrator_consensus_false_total[5m])) / sum(rate(orchestrator_analyze_requests_total[5m]))",
+          "legendFormat": "consensus false rate"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "title": "Confidence Score Distribution",
+      "type": "timeseries",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(vision_confidence_score_bucket[5m])) by (le))",
+          "legendFormat": "median confidence"
+        }
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Router Latency P95",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(router_route_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "router P95"
+        }
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Knowledge Map Latency P95",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(knowledge_map_duration_seconds_bucket[5m])) by (le))",
+          "legendFormat": "knowledge P95"
+        }
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Error Rate by Service",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "expr": "sum(rate(router_route_requests_total{status='error'}[5m])) by (status)",
+          "legendFormat": "router errors"
+        },
+        {
+          "expr": "sum(rate(vision_inference_requests_total{status='error'}[5m])) by (status)",
+          "legendFormat": "vision errors"
+        },
+        {
+          "expr": "sum(rate(knowledge_map_requests_total{status='error'}[5m])) by (status)",
+          "legendFormat": "knowledge errors"
+        },
+        {
+          "expr": "sum(rate(orchestrator_analyze_requests_total{status='error'}[5m])) by (status)",
+          "legendFormat": "orchestrator errors"
+        }
+      ]
+    }
+  ]
+}

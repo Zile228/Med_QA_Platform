@@ -16,6 +16,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY shared/ ./shared/
 COPY services/router/ ./services/router/
 
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
+
 EXPOSE 8001
 
 CMD ["uvicorn", "services.router.main:app", "--host", "0.0.0.0", "--port", "8001"]

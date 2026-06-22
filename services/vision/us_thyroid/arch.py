@@ -1,17 +1,17 @@
 """
 services/vision/us_thyroid/arch.py
 ====================================
-Model architecture cho Thyroid Ultrasound (TN3K dataset).
+Model architecture for Thyroid Ultrasound (TN3K dataset).
 
-Giống hệt us_breast/arch.py, chỉ thay:
+Identical to us_breast/arch.py, only changes:
   - NUM_CLASSES = 2  (benign=0, malignant=1)
-  - MEAN/STD     = giá trị tính từ TN3K training set
-  - IDX_TO_CLASS / CLASS_TO_IDX cập nhật cho thyroid
+  - MEAN/STD     = values computed from the TN3K training set
+  - IDX_TO_CLASS / CLASS_TO_IDX updated for thyroid
 
-Không copy:
-  - CapsuleLayer, CapsuleNetwork   (CLASSIFICATION_HEAD='fc', không dùng)
-  - DeformableConvBlock            (USE_Deform=False, không dùng)
-  - Dataset/transform classes      (training only - xem notebook train)
+Not copied:
+  - CapsuleLayer, CapsuleNetwork   (CLASSIFICATION_HEAD='fc', unused)
+  - DeformableConvBlock            (USE_Deform=False, unused)
+  - Dataset/transform classes      (training only - see the training notebook)
 """
 
 import torch
@@ -23,9 +23,9 @@ import timm
 
 class Config:
     """
-    Centralized config cho us_thyroid inference.
+    Centralized config for us_thyroid inference.
 
-    Mean/Std tinh tu TN3K training fold 0.
+    Mean/Std computed from TN3K training fold 0.
     """
     # Architecture
     MODEL_TYPE            = 'multitask'
@@ -38,8 +38,8 @@ class Config:
     IMG_SIZE = 256
     DEVICE   = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-    # TN3K dataset normalization - tính từ trainval fold 0
-    # Cập nhật giá trị thực tế sau khi chạy notebook
+    # TN3K dataset normalization - computed from trainval fold 0
+    # Update with real values after running the notebook
     MEAN = [0.2830, 0.2830, 0.2830]
     STD  = [0.1950, 0.1950, 0.1950]
 
@@ -47,7 +47,7 @@ class Config:
     IDX_TO_CLASS = {0: 'benign', 1: 'malignant'}
     CLASS_TO_IDX = {'benign': 0, 'malignant': 1}
 
-    # Tham so training (khong dung luc inference)
+    # Training parameters (not used at inference time)
     BATCH_SIZE      = 16
     EPOCHS          = 50
     LEARNING_RATE   = 1e-4
@@ -57,7 +57,7 @@ class Config:
 
 class ConvBlock(nn.Module):
     """
-    Double conv block cho decoder path của UNet.
+    Double conv block for the UNet decoder path.
     Conv3x3 -> BN -> ReLU -> Conv3x3 -> BN -> ReLU
     """
     def __init__(self, in_channels: int, out_channels: int):
@@ -78,12 +78,12 @@ class ConvBlock(nn.Module):
 
 class UNet_MTL(nn.Module):
     """
-    Multi-task UNet với EfficientNet-B4 encoder.
+    Multi-task UNet with an EfficientNet-B4 encoder.
 
-    Forward pass trả về (seg_output, cls_output, bottleneck_out):
+    Forward pass returns (seg_output, cls_output, bottleneck_out):
       - seg_output:     (B, 1, H, W)       - sigmoid mask [0, 1]
-      - cls_output:     (B, NUM_CLASSES)   - raw logits (trước softmax)
-      - bottleneck_out: (B, 448, h, w)     - feature map bottleneck
+      - cls_output:     (B, NUM_CLASSES)   - raw logits (before softmax)
+      - bottleneck_out: (B, 448, h, w)     - bottleneck feature map
 
     EfficientNet-B4 encoder channels: [24, 32, 56, 160, 448]
     """
@@ -109,7 +109,7 @@ class UNet_MTL(nn.Module):
         self.upconv1 = nn.ConvTranspose2d(ch[1], ch[0], kernel_size=2, stride=2)
         self.dec1    = ConvBlock(ch[0] + ch[0], ch[0])
 
-        # Segmentation head va classification head
+        # Segmentation head and classification head
         self.seg_head = nn.Conv2d(ch[0], 1, kernel_size=1)
         self.cls_head = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -132,7 +132,7 @@ class UNet_MTL(nn.Module):
         """
         e1, e2, e3, e4, bot = self.backbone(x)
 
-        # Classification tu bottleneck
+        # Classification from the bottleneck
         cls_output = self.cls_head(bot)
 
         # Decoder (segmentation branch)

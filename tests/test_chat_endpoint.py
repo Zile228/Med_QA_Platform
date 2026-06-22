@@ -1,5 +1,5 @@
 """
-Test cho section 5.2: chatbot multi-turn, cache context, /chat endpoint logic.
+Tests for section 5.2: multi-turn chatbot, context cache, /chat endpoint logic.
 """
 
 import asyncio
@@ -13,7 +13,7 @@ from unittest.mock import MagicMock, patch, AsyncMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 
-# Cache helpers (unit test, khong dung FastAPI TestClient)
+# Cache helpers (unit test, does not use FastAPI TestClient)
 
 from services.orchestrator import main as orch_main
 
@@ -68,20 +68,20 @@ def test_get_context_expired_raises_404():
     with pytest.raises(HTTPException) as exc:
         orch_main._get_context("old_img")
     assert exc.value.status_code == 404
-    assert "old_img" not in orch_main._context_cache   # bi xoa khoi cache
+    assert "old_img" not in orch_main._context_cache   # removed from cache
 
 
 def test_chat_uses_cached_context_not_reanalyzing():
     """
-    Sau khi _save_context, goi /chat phai lay tu cache -- khong goi
-    router/vision/knowledge lai. Kiem tra qua mock: cac service HTTP
-    khong duoc call.
+    After _save_context, calling /chat must read from the cache -- must not
+    call router/vision/knowledge again. Verified via mock: the HTTP
+    services must not be called.
     """
     orch_main._context_cache.clear()
     report = _make_report_dict("no_rerun")
     orch_main._save_context("no_rerun", report, [])
 
-    # Neu cache hoat dong dung, _get_context khong throw
+    # If the cache works correctly, _get_context does not throw
     entry = orch_main._get_context("no_rerun")
     assert entry is not None
 
@@ -118,12 +118,12 @@ def test_build_chat_prompt_includes_report_context():
     assert "2.5" in prompt         # area_cm2
     assert "Biopsy recommended" in prompt
     assert "guideline text" in prompt
-    assert "What is the size?" in prompt   # history duoc embed
-    assert "Is FNA needed?" in prompt      # cau hoi moi
+    assert "What is the size?" in prompt   # history is embedded
+    assert "Is FNA needed?" in prompt      # the new question
 
 
 def test_build_chat_prompt_history_order():
-    """History phai theo thu tu: cac luot cu truoc, cau hoi moi sau."""
+    """History must be in order: older turns first, new question last."""
     context = {"image_id": "x", "report": {"tier_1_structured": {
         "modality": "us", "organ": "breast", "label": "benign",
         "confidence": 0.8, "risk_category": "BI-RADS 3",
@@ -163,7 +163,7 @@ def test_mock_llm_client_chat_returns_string():
 
 
 def test_base_llm_client_chat_falls_back_to_generate():
-    """BaseLLMClient.chat() mac dinh goi generate() -- test qua MockLLMClient."""
+    """BaseLLMClient.chat() defaults to calling generate() -- tested via MockLLMClient."""
     client = MockLLMClient()
     messages = [{"role": "user", "content": "test"}]
     reply = client.chat(messages, system="System prompt")

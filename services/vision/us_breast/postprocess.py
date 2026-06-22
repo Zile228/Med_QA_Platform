@@ -8,9 +8,9 @@ Public API:
     get_location_quadrant(centroid, image_size, organ) -> tuple[str, str]
     postprocess_mask(mask_png_base64, original_size, organ, pixel_spacing_mm) -> dict
 
-Được gọi bởi knowledge/mapper.py - nhận mask dưới dạng base64 PNG qua HTTP body,
-KHÔNG đọc từ path trên disk (vision và knowledge là 2 container riêng, không
-share filesystem - xem ISSUES_AND_FIXES.md mục 1).
+Called by knowledge/mapper.py - receives the mask as a base64 PNG over the
+HTTP body, does NOT read from a path on disk (vision and knowledge are 2
+separate containers that do not share a filesystem - see ISSUES_AND_FIXES.md item 1).
 """
 
 import base64
@@ -19,25 +19,25 @@ import numpy as np
 from typing import Tuple
 
 
-# Tinh spatial features tu mask
+# Computing spatial features from the mask
 
 def extract_spatial_features(
     mask: np.ndarray,
     pixel_spacing_mm: float = 0.1,
 ) -> dict:
     """
-    Tính toán spatial features từ binary mask.
+    Computes spatial features from a binary mask.
 
     Args:
         mask:             binary mask (H, W), values 0 or 255
-        pixel_spacing_mm: khoảng cách thực tế mỗi pixel (mm).
-                          0.1mm/px là giá trị mặc định cho BUSI dataset.
-                          1 cm² = 100 mm² -> area_px * spacing² / 100
+        pixel_spacing_mm: real-world distance per pixel (mm).
+                          0.1mm/px is the default value for the BUSI dataset.
+                          1 cm2 = 100 mm2 -> area_px * spacing^2 / 100
 
-    Returns dict với:
+    Returns a dict with:
         bbox, area_cm2, centroid, width_px, height_px,
         aspect_ratio, circularity
-    Trả về empty dict nếu không tìm thấy contour (ảnh normal/no lesion).
+    Returns an empty dict if no contour is found (normal image/no lesion).
     """
     mask_uint8 = mask.astype(np.uint8)
     if mask_uint8.max() > 1:
@@ -50,7 +50,7 @@ def extract_spatial_features(
     if not contours:
         return {}
 
-    # Lay contour lon nhat, bo qua noise
+    # Take the largest contour, ignore noise
     largest = max(contours, key=cv2.contourArea)
 
     x, y, w, h = cv2.boundingRect(largest)
@@ -64,7 +64,7 @@ def extract_spatial_features(
     else:
         cx, cy = x + w // 2, y + h // 2
 
-    # Tinh toan cac shape descriptor
+    # Compute shape descriptors
     aspect_ratio = round(w / h, 3) if h > 0 else 1.0
     perimeter = cv2.arcLength(largest, True)
     circularity = (
@@ -83,7 +83,7 @@ def extract_spatial_features(
     }
 
 
-# Xac dinh quadrant cua khoi u
+# Determining the lesion's quadrant
 
 def get_location_quadrant(
     centroid: list,
@@ -91,32 +91,32 @@ def get_location_quadrant(
     organ: str = "breast",
 ) -> Tuple[str, str]:
     """
-    Xác định quadrant của khối u từ centroid và image size.
+    Determines the lesion's quadrant from the centroid and image size.
 
     Args:
         centroid:   [cx, cy] pixel coordinates
-        image_size: (H, W) của ảnh gốc
+        image_size: (H, W) of the original image
         organ:      'breast' | 'thyroid'
 
     Returns:
         (quadrant_str, confidence_str)
 
-    Breast quadrants (theo convention lâm sàng):
+    Breast quadrants (following clinical convention):
         Upper-outer | Upper-inner | Lower-outer | Lower-inner | Central
-        Trục: x < W/2 -> outer (nếu right breast, cần flip - POC giả sử right breast)
+        Axis: x < W/2 -> outer (if right breast, needs flipping - POC assumes right breast)
               y < H/2 -> upper
 
     Thyroid:
         Left-lobe | Right-lobe | Isthmus
-        Trục: x < W*0.35 -> left-lobe, x > W*0.65 -> right-lobe, else isthmus
+        Axis: x < W*0.35 -> left-lobe, x > W*0.65 -> right-lobe, else isthmus
     """
     H, W = image_size
     cx, cy = centroid
 
-    # Confidence dua theo khoang cach centroid den bien anh
+    # Confidence based on the distance from the centroid to the image edge
     dist_to_edge = min(cx, W - cx, cy, H - cy)
     if dist_to_edge < 0.1 * min(H, W):
-        confidence = "low"    # centroid gần edge -> quadrant không chắc
+        confidence = "low"    # centroid near the edge -> quadrant is uncertain
     elif dist_to_edge < 0.2 * min(H, W):
         confidence = "medium"
     else:
@@ -124,13 +124,13 @@ def get_location_quadrant(
 
     if organ == "breast":
         mid_x, mid_y = W / 2, H / 2
-        # Margin zone quanh midline -> central
+        # Margin zone around the midline -> central
         if abs(cx - mid_x) < W * 0.1 and abs(cy - mid_y) < H * 0.1:
             return "central", confidence
 
         vertical   = "upper" if cy < mid_y else "lower"
         horizontal = "outer" if cx < mid_x else "inner"
-        # Gia su right breast: outer = phia trai anh
+        # Assumes right breast: outer = left side of the image
         return f"{vertical}-{horizontal}", confidence
 
     elif organ == "thyroid":
@@ -145,7 +145,7 @@ def get_location_quadrant(
         return "unknown", "low"
 
 
-# Ham postprocess tong hop
+# Main postprocess function
 
 def postprocess_mask(
     mask_png_base64: str,
@@ -154,45 +154,46 @@ def postprocess_mask(
     pixel_spacing_mm: float = 0.1,
 ) -> dict:
     """
-    Decode mask từ base64 PNG -> trả về toàn bộ SpatialDerived fields.
+    Decodes the mask from a base64 PNG -> returns all SpatialDerived fields.
 
     Args:
-        mask_png_base64:  mask PNG encode base64 (nhận trực tiếp qua HTTP body,
-                           KHÔNG đọc từ path trên disk - vision và knowledge là
-                           2 container riêng, không share filesystem)
-        original_size:    (H, W) ảnh gốc
+        mask_png_base64:  mask PNG base64-encoded (received directly over the
+                           HTTP body, does NOT read from a path on disk - vision
+                           and knowledge are 2 separate containers that don't
+                           share a filesystem)
+        original_size:    (H, W) of the original image
         organ:            'breast' | 'thyroid'
         pixel_spacing_mm: mm/pixel
 
-    Returns dict map 1-1 vào SpatialDerived schema.
+    Returns a dict mapping 1-1 into the SpatialDerived schema.
 
     Raises:
-        ValueError: nếu base64 không decode được, hoặc bytes không phải PNG hợp lệ.
-                    Fail loud, khong fallback im lang de tranh du lieu gia.
+        ValueError: if the base64 cannot be decoded, or the bytes are not a valid PNG.
+                    Fails loudly, no silent fallback, to avoid fabricated data.
     """
     if not mask_png_base64:
         raise ValueError(
-            "mask_png_base64 rỗng - vision service không trả về mask. "
-            "Đây là lỗi upstream, không phải case 'normal/no lesion'."
+            "mask_png_base64 is empty - vision service did not return a mask. "
+            "This is an upstream error, not a 'normal/no lesion' case."
         )
 
     try:
         mask_bytes = base64.b64decode(mask_png_base64, validate=True)
     except Exception as e:
-        raise ValueError(f"Không decode được base64 của mask: {e}") from e
+        raise ValueError(f"Failed to decode base64 mask: {e}") from e
 
     mask_array = np.frombuffer(mask_bytes, dtype=np.uint8)
     mask = cv2.imdecode(mask_array, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         raise ValueError(
-            "cv2.imdecode trả về None - base64 decode được nhưng không phải PNG hợp lệ. "
-            "Kiểm tra lại bước encode ở vision service."
+            "cv2.imdecode returned None - base64 decoded but is not a valid PNG. "
+            "Check the encoding step in the vision service."
         )
 
     spatial = extract_spatial_features(mask, pixel_spacing_mm)
 
     if not spatial:
-        # Case hop le: mask OK nhung khong co contour (anh normal/no lesion)
+        # Valid case: mask is OK but has no contour (normal image/no lesion)
         return _empty_spatial(original_size)
 
     quadrant, loc_confidence = get_location_quadrant(
@@ -213,7 +214,7 @@ def postprocess_mask(
 
 
 def _empty_spatial(image_size: Tuple[int, int]) -> dict:
-    """Fallback khi không detect được lesion (ảnh normal)."""
+    """Fallback for when no lesion is detected (normal image)."""
     H, W = image_size
     return {
         "bbox":                [0, 0, 0, 0],
