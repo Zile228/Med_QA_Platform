@@ -19,6 +19,7 @@ Response: RoutingResult schema (JSON)
 import os
 import sys
 import time
+import logging
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -30,9 +31,14 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from shared.schemas import RoutingResult
 from shared.telemetry import setup_tracing, get_tracer
+from shared.image_validation import (
+    check_upload_size, check_image_dimensions, ImageValidationError
+)
 from services.router.model import (
     load_router, run_routing, HINT_ORGAN_TO_MODULE_KEY
 )
+
+logger = logging.getLogger(__name__)
 
 try:
     from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
@@ -114,11 +120,15 @@ async def route_image(
     Hint bi bo qua hoan toan khi is_ood=True.
     """
     if _model is None:
-        raise HTTPException(status_code=503, detail="Router model chua load.")
+        raise HTTPException(status_code=503, detail="Router model not loaded.")
 
     image_bytes = await image.read()
     if not image_bytes:
-        raise HTTPException(status_code=400, detail="File anh rong.")
+        raise HTTPException(status_code=400, detail="Empty image file.")
+    try:
+        check_upload_size(image_bytes)
+    except ImageValidationError as e:
+        raise HTTPException(status_code=413, detail=str(e))
 
     hint_key = None
     raw_hint = organ_hint or modality_hint
@@ -128,8 +138,8 @@ async def route_image(
             raise HTTPException(
                 status_code=400,
                 detail=(
-                    f"organ_hint '{raw_hint}' khong hop le. "
-                    f"Gia tri chap nhan: {sorted(_VALID_ORGAN_HINTS)}"
+                    f"organ_hint '{raw_hint}' is not valid. "
+                    f"Accepted values: {sorted(_VALID_ORGAN_HINTS)}"
                 ),
             )
         hint_key = HINT_ORGAN_TO_MODULE_KEY[raw_hint]
@@ -164,6 +174,7 @@ async def route_image(
             span.record_exception(e)
             if PROM_AVAILABLE:
                 _route_counter.labels(module_key="unknown", is_ood="false", status="error").inc()
-            raise HTTPException(status_code=500, detail=f"Routing error: {str(e)}")
+            logger.exception("Routing failed")
+            raise HTTPException(status_code=500, detail="Internal error during routing. Check server logs.")
 
     return RoutingResult(**result)

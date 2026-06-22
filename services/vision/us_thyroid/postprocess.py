@@ -1,14 +1,14 @@
 """
 services/vision/us_thyroid/postprocess.py
 ==========================================
-Mask (numpy array / base64 PNG) -> SpatialDerived fields cho thyroid.
+Mask (numpy array / base64 PNG) -> SpatialDerived fields for thyroid.
 
-Giống hệt us_breast/postprocess.py nhưng:
+Identical to us_breast/postprocess.py except:
   - Default organ='thyroid'
-  - get_location_quadrant mặc định dùng thyroid logic (left-lobe/right-lobe/isthmus)
-  - pixel_spacing_mm default = 0.1 (giữ nguyên, cần calibrate theo thiết bị thực)
+  - get_location_quadrant defaults to thyroid logic (left-lobe/right-lobe/isthmus)
+  - pixel_spacing_mm default = 0.1 (kept as-is, needs calibration against the real device)
 
-Public API (giống us_breast):
+Public API (same as us_breast):
     extract_spatial_features(mask, pixel_spacing_mm) -> dict
     get_location_quadrant(centroid, image_size, organ) -> tuple[str, str]
     postprocess_mask(mask_png_base64, original_size, organ, pixel_spacing_mm) -> dict
@@ -20,22 +20,22 @@ import numpy as np
 from typing import Tuple
 
 
-# Tinh spatial features tu mask
+# Computing spatial features from the mask
 
 def extract_spatial_features(
     mask: np.ndarray,
     pixel_spacing_mm: float = 0.1,
 ) -> dict:
     """
-    Tính spatial features từ binary mask.
+    Computes spatial features from a binary mask.
 
     Args:
         mask:             binary mask (H, W), values 0 or 255
-        pixel_spacing_mm: mm/pixel (default 0.1 - cần calibrate theo probe)
+        pixel_spacing_mm: mm/pixel (default 0.1 - needs calibration against the probe)
 
-    Returns dict: bbox, area_cm2, centroid, width_px, height_px,
+    Returns a dict: bbox, area_cm2, centroid, width_px, height_px,
                   aspect_ratio, circularity.
-    Trả về empty dict nếu không có contour (không detect được nodule).
+    Returns an empty dict if there is no contour (no nodule detected).
     """
     mask_u8 = mask.astype(np.uint8)
     if mask_u8.max() > 1:
@@ -77,7 +77,7 @@ def extract_spatial_features(
     }
 
 
-# Xac dinh quadrant cua nodule
+# Determining the nodule's quadrant
 
 def get_location_quadrant(
     centroid: list,
@@ -85,13 +85,13 @@ def get_location_quadrant(
     organ: str = 'thyroid',
 ) -> Tuple[str, str]:
     """
-    Xác định quadrant của nodule từ centroid.
+    Determines the nodule's quadrant from the centroid.
 
     Thyroid convention:
         x < W*0.35  -> left-lobe
         x > W*0.65  -> right-lobe
         else        -> isthmus
-    (Breast logic giữ nguyên để backward-compatible)
+    (Breast logic kept as-is for backward compatibility)
 
     Returns: (quadrant_str, confidence_str)
     """
@@ -126,7 +126,7 @@ def get_location_quadrant(
         return 'unknown', 'low'
 
 
-# Ham postprocess tong hop
+# Main postprocess function
 
 def postprocess_mask(
     mask_png_base64: str,
@@ -135,40 +135,40 @@ def postprocess_mask(
     pixel_spacing_mm: float = 0.1,
 ) -> dict:
     """
-    Decode mask từ base64 PNG -> SpatialDerived fields.
+    Decodes the mask from a base64 PNG -> SpatialDerived fields.
 
     Args:
-        mask_png_base64:  mask PNG encode base64
-        original_size:    (H, W) ảnh gốc
+        mask_png_base64:  mask PNG base64-encoded
+        original_size:    (H, W) of the original image
         organ:            'thyroid' (default) | 'breast'
         pixel_spacing_mm: mm/pixel
 
     Raises:
-        ValueError: nếu base64 không decode được hoặc không phải PNG hợp lệ.
+        ValueError: if the base64 cannot be decoded or is not a valid PNG.
     """
     if not mask_png_base64:
         raise ValueError(
-            'mask_png_base64 rỗng - vision service không trả về mask. '
-            'Đây là lỗi upstream, không phải case no-nodule.'
+            'mask_png_base64 is empty - vision service did not return a mask. '
+            'This is an upstream error, not a no-nodule case.'
         )
 
     try:
         mask_bytes = base64.b64decode(mask_png_base64, validate=True)
     except Exception as e:
-        raise ValueError(f'Không decode được base64 của mask: {e}') from e
+        raise ValueError(f'Failed to decode base64 mask: {e}') from e
 
     mask_array = np.frombuffer(mask_bytes, dtype=np.uint8)
     mask       = cv2.imdecode(mask_array, cv2.IMREAD_GRAYSCALE)
     if mask is None:
         raise ValueError(
-            'cv2.imdecode trả về None - base64 decode được nhưng không phải '
-            'PNG hợp lệ. Kiểm tra lại bước encode ở vision service.'
+            'cv2.imdecode returned None - base64 decoded but is not a valid '
+            'PNG. Check the encoding step in the vision service.'
         )
 
     spatial = extract_spatial_features(mask, pixel_spacing_mm)
 
     if not spatial:
-        # Case hợp lệ: mask OK nhưng không có nodule (model predict benign/clear)
+        # Valid case: mask is OK but there is no nodule (model predicts benign/clear)
         return _empty_spatial(original_size)
 
     quadrant, loc_confidence = get_location_quadrant(
@@ -189,7 +189,7 @@ def postprocess_mask(
 
 
 def _empty_spatial(image_size: Tuple[int, int]) -> dict:
-    """Fallback khi không detect được nodule (thyroid clear)."""
+    """Fallback for when no nodule is detected (thyroid clear)."""
     H, W = image_size
     return {
         'bbox':                [0, 0, 0, 0],

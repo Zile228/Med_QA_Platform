@@ -10,7 +10,7 @@ Endpoints:
     GET  /metrics             - Prometheus metrics
 
 Request: multipart/form-data
-    image: UploadFile  - anh PNG/JPG
+    image: UploadFile  - PNG/JPG image
     organ: str         - 'breast' | 'thyroid'
 
 Response: ModelOutput schema (JSON)
@@ -19,6 +19,7 @@ Response: ModelOutput schema (JSON)
 import os
 import sys
 import time
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
@@ -29,21 +30,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from shared.schemas import ModelOutput
 from shared.telemetry import setup_tracing, get_tracer
+from shared.image_validation import (
+    check_upload_size, ImageValidationError
+)
 from services.vision.us_breast.model  import load_model as load_breast_model,  run_inference as run_breast_inference
 from services.vision.us_thyroid.model import load_model as load_thyroid_model, run_inference as run_thyroid_inference
+
+logger = logging.getLogger(__name__)
 
 try:
     from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
     PROM_AVAILABLE = True
     _infer_latency = Histogram(
         "vision_inference_duration_seconds",
-        "Latency cua inference theo organ",
+        "Latency of inference by organ",
         ["organ"],
         buckets=[0.1, 0.5, 1.0, 2.0, 5.0, 10.0],
     )
     _infer_counter = Counter(
         "vision_inference_requests_total",
-        "Tong so request inference",
+        "Total number of inference requests",
         ["organ", "label", "status"],
     )
 except ImportError:
@@ -70,14 +76,14 @@ async def lifespan(app: FastAPI):
         print(f"[vision] Breast model loaded OK - device: {_breast_cfg.DEVICE}")
     except FileNotFoundError as e:
         print(f"[vision] WARNING (breast): {e}")
-        print("[vision] /analyze/us_breast se return 503 cho den khi co checkpoint.")
+        print("[vision] /analyze/us_breast will return 503 until a checkpoint is available.")
 
     try:
         _thyroid_model, _thyroid_cfg = load_thyroid_model(THYROID_CHECKPOINT, DEVICE)
         print(f"[vision] Thyroid model loaded OK - device: {_thyroid_cfg.DEVICE}")
     except FileNotFoundError as e:
         print(f"[vision] WARNING (thyroid): {e}")
-        print("[vision] /analyze/us_thyroid se return 503 cho den khi co checkpoint.")
+        print("[vision] /analyze/us_thyroid will return 503 until a checkpoint is available.")
 
     yield
 
@@ -107,37 +113,41 @@ def health():
 @app.get("/metrics", response_class=PlainTextResponse)
 def metrics():
     if not PROM_AVAILABLE:
-        return PlainTextResponse("# prometheus_client chua install\n", status_code=200)
+        return PlainTextResponse("# prometheus_client not installed\n", status_code=200)
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 async def _read_image(image: UploadFile) -> bytes:
-    """Doc va validate anh upload."""
+    """Read and validate the uploaded image."""
     image_bytes = await image.read()
     if not image_bytes:
-        raise HTTPException(status_code=400, detail="File anh rong.")
+        raise HTTPException(status_code=400, detail="Empty image file.")
+    try:
+        check_upload_size(image_bytes)
+    except ImageValidationError as e:
+        raise HTTPException(status_code=413, detail=str(e))
     content_type = image.content_type or ""
     if content_type and not content_type.startswith("image/"):
         raise HTTPException(
             status_code=400,
-            detail=f"File khong phai anh: {content_type}",
+            detail=f"File is not an image: {content_type}",
         )
     return image_bytes
 
 
 @app.post("/analyze/us_breast", response_model=ModelOutput)
 async def analyze_us_breast(
-    image: UploadFile = File(..., description="Anh ultrasound breast (PNG/JPG)"),
+    image: UploadFile = File(..., description="Breast ultrasound image (PNG/JPG)"),
     organ: str = Form(default="breast"),
 ):
     """
-    Inference pipeline cho Breast Ultrasound (BUSI dataset).
-    Tra ve ModelOutput co bottleneck_features de orchestrator dua vao LLM prompt.
+    Inference pipeline for Breast Ultrasound (BUSI dataset).
+    Returns a ModelOutput with bottleneck_features for the orchestrator to use in the LLM prompt.
     """
     if _breast_model is None:
         raise HTTPException(
             status_code=503,
-            detail="Breast model chua load. Dat checkpoint vao models/checkpoints/ va restart.",
+            detail="Breast model not loaded. Place the checkpoint in models/checkpoints/ and restart.",
         )
     image_bytes = await _read_image(image)
 
@@ -155,11 +165,22 @@ async def analyze_us_breast(
                     organ="breast", label=result.get("top_label", "unknown"), status="ok"
                 ).inc()
                 _infer_latency.labels(organ="breast").observe(time.perf_counter() - t_start)
+        except ImageValidationError as e:
+            span.record_exception(e)
+            if PROM_AVAILABLE:
+                _infer_counter.labels(organ="breast", label="unknown", status="error").inc()
+            raise HTTPException(status_code=413, detail=str(e))
+        except ValueError as e:
+            span.record_exception(e)
+            if PROM_AVAILABLE:
+                _infer_counter.labels(organ="breast", label="unknown", status="error").inc()
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             span.record_exception(e)
             if PROM_AVAILABLE:
                 _infer_counter.labels(organ="breast", label="unknown", status="error").inc()
-            raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+            logger.exception("Inference failed (us_breast)")
+            raise HTTPException(status_code=500, detail="Internal error during inference. Check server logs.")
 
     return ModelOutput(
         top_label=result["top_label"],
@@ -173,20 +194,20 @@ async def analyze_us_breast(
 
 @app.post("/analyze/us_thyroid", response_model=ModelOutput)
 async def analyze_us_thyroid(
-    image: UploadFile = File(..., description="Anh ultrasound thyroid (PNG/JPG)"),
+    image: UploadFile = File(..., description="Thyroid ultrasound image (PNG/JPG)"),
     organ: str = Form(default="thyroid"),
 ):
     """
-    Inference pipeline cho Thyroid Ultrasound (TN3K dataset).
-    Cung schema voi us_breast -- orchestrator dung chung 1 code path.
+    Inference pipeline for Thyroid Ultrasound (TN3K dataset).
+    Same schema as us_breast -- the orchestrator uses one shared code path.
     """
     if _thyroid_model is None:
         raise HTTPException(
             status_code=503,
             detail=(
-                "Thyroid model chua load. "
-                "Chay notebook tn3k_thyroid_train.ipynb de tao checkpoint, "
-                "sau do dat vao models/checkpoints/mtl_effnet_fc_conv_thyroid.pt va restart."
+                "Thyroid model not loaded. "
+                "Run the tn3k_thyroid_train.ipynb notebook to produce a checkpoint, "
+                "then place it at models/checkpoints/mtl_effnet_fc_conv_thyroid.pt and restart."
             ),
         )
     image_bytes = await _read_image(image)
@@ -205,11 +226,22 @@ async def analyze_us_thyroid(
                     organ="thyroid", label=result.get("top_label", "unknown"), status="ok"
                 ).inc()
                 _infer_latency.labels(organ="thyroid").observe(time.perf_counter() - t_start)
+        except ImageValidationError as e:
+            span.record_exception(e)
+            if PROM_AVAILABLE:
+                _infer_counter.labels(organ="thyroid", label="unknown", status="error").inc()
+            raise HTTPException(status_code=413, detail=str(e))
+        except ValueError as e:
+            span.record_exception(e)
+            if PROM_AVAILABLE:
+                _infer_counter.labels(organ="thyroid", label="unknown", status="error").inc()
+            raise HTTPException(status_code=400, detail=str(e))
         except Exception as e:
             span.record_exception(e)
             if PROM_AVAILABLE:
                 _infer_counter.labels(organ="thyroid", label="unknown", status="error").inc()
-            raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+            logger.exception("Inference failed (us_thyroid)")
+            raise HTTPException(status_code=500, detail="Internal error during inference. Check server logs.")
 
     return ModelOutput(
         top_label=result["top_label"],
@@ -226,5 +258,5 @@ async def analyze_xray(image: UploadFile = File(...)):
     """Placeholder - Phase 2 (NIH ChestX-ray14)."""
     raise HTTPException(
         status_code=501,
-        detail="X-Ray module chua implement. Roadmap: Phase 2.",
+        detail="X-Ray module not implemented yet. Roadmap: Phase 2.",
     )

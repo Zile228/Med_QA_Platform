@@ -1,16 +1,16 @@
 """
 shared/telemetry.py
 ====================
-Khoi tao OpenTelemetry tracer dung chung cho moi service.
+Shared OpenTelemetry tracer initialization used by every service.
 
-Moi service goi setup_tracing(service_name) mot lan duy nhat khi startup,
-sau do dung get_tracer() de lay tracer va bat dau span.
+Each service calls setup_tracing(service_name) exactly once on startup,
+then uses get_tracer() to get the tracer and start spans.
 
-OTLP exporter gui trace ve Jaeger collector qua gRPC (port 4317).
-Neu OTEL_EXPORTER_OTLP_ENDPOINT chua set hoac exporter loi, tracer
-fallback ve NoOpTracer -- service van chay binh thuong, chi mat trace.
+The OTLP exporter sends traces to the Jaeger collector over gRPC (port 4317).
+If OTEL_EXPORTER_OTLP_ENDPOINT is unset or the exporter fails, the tracer
+falls back to NoOpTracer -- the service still runs normally, it just loses tracing.
 
-Chi can cai them:
+Requires installing:
     opentelemetry-sdk
     opentelemetry-exporter-otlp-proto-grpc
     opentelemetry-instrumentation-fastapi
@@ -36,16 +36,16 @@ _tracer = None
 
 def setup_tracing(service_name: str, app=None) -> None:
     """
-    Khoi tao TracerProvider va export OTLP ve Jaeger.
-    Goi mot lan duy nhat trong lifespan hoac module-level cua moi service.
+    Initialize the TracerProvider and export OTLP to Jaeger.
+    Call exactly once in the lifespan or module-level of each service.
 
-    app: FastAPI instance, neu truyen vao thi FastAPIInstrumentor se tu dong
-         tao span cho moi HTTP request ma khong can them decorator tay.
+    app: FastAPI instance, if provided FastAPIInstrumentor will automatically
+         create a span for every HTTP request without needing manual decorators.
     """
     global _tracer
 
     if not OTEL_AVAILABLE:
-        print(f"[telemetry:{service_name}] opentelemetry chua install -- tracing disabled.")
+        print(f"[telemetry:{service_name}] opentelemetry not installed -- tracing disabled.")
         return
 
     endpoint = os.getenv(
@@ -67,15 +67,15 @@ def setup_tracing(service_name: str, app=None) -> None:
 
         print(f"[telemetry:{service_name}] Tracing -> {endpoint}")
     except Exception as e:
-        print(f"[telemetry:{service_name}] Setup loi: {e} -- tracing disabled.")
+        print(f"[telemetry:{service_name}] Setup failed: {e} -- tracing disabled.")
         _tracer = None
 
 
 def get_tracer():
     """
-    Tra ve tracer da khoi tao, hoac NoOpTracer neu chua setup.
-    Caller dung nhu sau:
-        with get_tracer().start_as_current_span("ten_span") as span:
+    Return the initialized tracer, or NoOpTracer if not yet set up.
+    Callers use it like this:
+        with get_tracer().start_as_current_span("span_name") as span:
             span.set_attribute("key", "value")
     """
     if not OTEL_AVAILABLE or _tracer is None:
@@ -84,7 +84,7 @@ def get_tracer():
 
 
 class _NoOpSpan:
-    """Span gia -- khong lam gi, chi de code goi set_attribute ma khong crash."""
+    """Fake span -- does nothing, just lets code call set_attribute without crashing."""
 
     def set_attribute(self, key, value):
         pass
@@ -103,7 +103,7 @@ class _NoOpSpan:
 
 
 class _NoOpTracer:
-    """Tracer gia khi OTEL chua install hoac exporter loi."""
+    """Fake tracer used when OTEL is not installed or the exporter fails."""
 
     def start_as_current_span(self, name, **kwargs):
         return _NoOpSpan()

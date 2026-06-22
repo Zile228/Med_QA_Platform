@@ -1,10 +1,10 @@
 """
 services/orchestrator/llm_client.py
 =====================================
-LLM client -- ho tro 2 backend: Ollama (local) va Google Gemini (cloud).
+LLM client -- supports 2 backends: Ollama (local) and Google Gemini (cloud).
 
-Backend chon qua env LLM_BACKEND='ollama' | 'google'.
-Swap backend = doi 1 env var, khong sua code.
+Backend is chosen via env LLM_BACKEND='ollama' | 'google'.
+Swap backend = change 1 env var, no code changes needed.
 
 Public API:
     get_llm_client() -> BaseLLMClient
@@ -18,12 +18,12 @@ from abc import ABC, abstractmethod
 from typing import Optional, List
 
 
-# Lop co so cho LLM client
+# Base class for LLM clients
 
 class BaseLLMClient(ABC):
     @abstractmethod
     def generate(self, prompt: str, system: Optional[str] = None) -> str:
-        """Single-turn: gui prompt -> tra ve text response."""
+        """Single-turn: send a prompt -> return the text response."""
         ...
 
     def chat(
@@ -32,10 +32,11 @@ class BaseLLMClient(ABC):
         system: Optional[str] = None,
     ) -> str:
         """
-        Multi-turn: nhan list message (role/content) -> tra ve reply.
+        Multi-turn: takes a list of messages (role/content) -> returns a reply.
 
-        Default implementation gop history thanh 1 prompt roi goi generate().
-        Subclass override de dung native multi-turn API neu co.
+        The default implementation concatenates history into one prompt then
+        calls generate(). Subclasses override this to use a native multi-turn
+        API where available.
 
         messages: [{"role": "user"|"assistant", "content": str}, ...]
         """
@@ -46,12 +47,12 @@ class BaseLLMClient(ABC):
         return self.generate(combined, system=system)
 
 
-# Client cho Ollama (local)
+# Client for Ollama (local)
 
 class OllamaClient(BaseLLMClient):
     """
-    Goi Ollama REST API tai localhost:11434.
-    Khong can API key -- chay hoan toan local.
+    Calls the Ollama REST API at localhost:11434.
+    No API key needed -- runs entirely locally.
     """
 
     def __init__(
@@ -64,7 +65,7 @@ class OllamaClient(BaseLLMClient):
         self.base_url = (
             base_url or os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
         ).rstrip("/")
-        self.model = model or os.getenv("OLLAMA_MODEL", "llava-med")
+        self.model = model or os.getenv("OLLAMA_MODEL", "phi4-mini")
         self.timeout = timeout
         self._client = httpx.Client(timeout=timeout)
         print(f"[llm] OllamaClient -> {self.base_url} | model: {self.model}")
@@ -85,7 +86,7 @@ class OllamaClient(BaseLLMClient):
         messages: List[dict],
         system: Optional[str] = None,
     ) -> str:
-        """Dung /api/chat cua Ollama de giu native conversation context."""
+        """Uses Ollama's /api/chat to keep native conversation context."""
         ollama_messages = []
         if system:
             ollama_messages.append({"role": "system", "content": system})
@@ -100,12 +101,12 @@ class OllamaClient(BaseLLMClient):
             raise RuntimeError(f"[OllamaClient] Chat failed: {e}")
 
 
-# Client cho Google Gemini
+# Client for Google Gemini
 
 class GoogleGeminiClient(BaseLLMClient):
     """
-    Goi Google Gemini API qua SDK moi 'google-genai'.
-    Can GOOGLE_API_KEY trong env.
+    Calls the Google Gemini API via the 'google-genai' SDK.
+    Requires GOOGLE_API_KEY in env.
     Default model: gemini-2.5-flash.
     """
 
@@ -117,11 +118,11 @@ class GoogleGeminiClient(BaseLLMClient):
         try:
             from google import genai
         except ImportError:
-            raise ImportError("google-genai chua install. Chay: pip install google-genai")
+            raise ImportError("google-genai is not installed. Run: pip install google-genai")
 
         self.api_key = api_key or os.getenv("GOOGLE_API_KEY", "")
         if not self.api_key:
-            raise ValueError("GOOGLE_API_KEY khong tim thay trong env.")
+            raise ValueError("GOOGLE_API_KEY not found in env.")
 
         self.model_name = model or os.getenv("GOOGLE_MODEL", "gemini-2.5-flash")
         self._client = genai.Client(api_key=self.api_key)
@@ -145,8 +146,8 @@ class GoogleGeminiClient(BaseLLMClient):
         system: Optional[str] = None,
     ) -> str:
         """
-        Multi-turn dung google-genai contents list.
-        System prompt duoc ghep vao dau message user dau tien.
+        Multi-turn using the google-genai contents list.
+        The system prompt is prepended to the first user message.
         """
         contents = []
         for i, m in enumerate(messages):
@@ -167,12 +168,12 @@ class GoogleGeminiClient(BaseLLMClient):
             raise RuntimeError(f"[GoogleGeminiClient] Chat failed: {e}")
 
 
-# Client gia lap cho dev/test
+# Mock client for dev/test
 
 class MockLLMClient(BaseLLMClient):
     """
-    Tra ve template text co dinh.
-    Dung khi LLM_BACKEND='mock' hoac khong co Ollama/Google key.
+    Returns fixed template text.
+    Used when LLM_BACKEND='mock' or no Ollama/Google key is available.
     """
 
     def generate(self, prompt: str, system: Optional[str] = None) -> str:
@@ -190,11 +191,11 @@ class MockLLMClient(BaseLLMClient):
         return f"[MOCK LLM] Echo: {last}"
 
 
-# Factory: chon client theo env
+# Factory: chooses the client based on env
 
 def get_llm_client() -> BaseLLMClient:
     """
-    Doc LLM_BACKEND tu env -> tra ve dung client.
+    Reads LLM_BACKEND from env -> returns the matching client.
 
     ollama  -> OllamaClient (default)
     google  -> GoogleGeminiClient
@@ -209,5 +210,5 @@ def get_llm_client() -> BaseLLMClient:
     elif backend == "mock":
         return MockLLMClient()
     else:
-        print(f"[llm] WARNING: LLM_BACKEND='{backend}' khong nhan ra -> fallback MockLLMClient")
+        print(f"[llm] WARNING: LLM_BACKEND='{backend}' not recognized -> falling back to MockLLMClient")
         return MockLLMClient()

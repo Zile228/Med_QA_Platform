@@ -26,6 +26,8 @@ import torch.nn as nn
 from torchvision import transforms
 from PIL import Image
 
+from shared.image_validation import check_image_dimensions
+
 
 # Cau hinh cho router
 
@@ -242,6 +244,7 @@ def run_routing(
     img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
     if img_bgr is None:
         raise ValueError("Không decode được ảnh. Kiểm tra format (PNG/JPG).")
+    check_image_dimensions(width=img_bgr.shape[1], height=img_bgr.shape[0])
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img_rgb)
 

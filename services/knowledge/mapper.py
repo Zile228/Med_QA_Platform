@@ -3,17 +3,17 @@ services/knowledge/mapper.py
 ==============================
 Layer 3 - Knowledge Mapper.
 
-Nhận ModelOutput + RoutingResult -> trả về KnowledgeMapped + SpatialDerived.
+Takes ModelOutput + RoutingResult -> returns KnowledgeMapped + SpatialDerived.
 
-Không cần ML - thuần rule-based + hardcode clinical knowledge.
-Design: dễ audit, dễ sửa bởi clinician, không có black box.
+No ML needed - purely rule-based + hardcoded clinical knowledge.
+Design goal: easy to audit, easy for a clinician to edit, no black box.
 
 Public API:
     map_knowledge(modality, organ, top_label, confidence, all_scores) -> dict
-        -> map 1-1 vào KnowledgeMapped schema
+        -> maps 1-1 into the KnowledgeMapped schema
 
     derive_spatial(mask_png_base64, original_size, organ) -> dict
-        -> map 1-1 vào SpatialDerived schema
+        -> maps 1-1 into the SpatialDerived schema
 """
 
 import os
@@ -30,30 +30,30 @@ _POSTPROCESS_BY_ORGAN = {
 }
 
 
-# Bang tra cuu kien thuc lam sang
+# Clinical knowledge lookup tables
 
-# Breast: anh xa BI-RADS theo label
+# Breast: maps BI-RADS by label
 BIRADS_MAP = {
     "normal":    {"birads": "BI-RADS 1", "risk_category": "Negative (BI-RADS 1)"},
     "benign":    {"birads": "BI-RADS 3", "risk_category": "Probably benign (BI-RADS 3)"},
     "malignant": {"birads": "BI-RADS 4C–5", "risk_category": "High suspicion (BI-RADS 4C–5)"},
 }
 
-# Thyroid: anh xa TI-RADS theo label
+# Thyroid: maps TI-RADS by label
 TIRADS_MAP = {
     "normal":    {"tirads": "TI-RADS 1", "risk_category": "Normal thyroid (TI-RADS 1)"},
     "benign":    {"tirads": "TI-RADS 3", "risk_category": "Mildly suspicious (TI-RADS 3)"},
     "malignant": {"tirads": "TI-RADS 5", "risk_category": "Highly suspicious (TI-RADS 5)"},
 }
 
-# Muc do nghiem trong dung chung cho moi modality (1=nhe, 4=nguy cap)
+# Severity level shared across all modalities (1=mild, 4=critical)
 SEVERITY_MAP = {
     "normal":    {"severity": "incidental",   "severity_level": 1},
     "benign":    {"severity": "significant",  "severity_level": 2},
     "malignant": {"severity": "urgent",       "severity_level": 3},
 }
 
-# Ma ICD-10 tuong ung theo organ va label
+# ICD-10 codes matched by organ and label
 ICD10_MAP = {
     "breast": {
         "normal":    "Z12.31",   # Encounter for screening mammogram
@@ -67,7 +67,7 @@ ICD10_MAP = {
     },
 }
 
-# Mo ta lam sang ngan gon cho LLM
+# Short clinical descriptions for the LLM
 DESCRIPTION_MAP = {
     ("breast", "normal"):    (
         "No sonographic evidence of focal lesion. Breast parenchyma appears within normal limits."
@@ -99,7 +99,7 @@ DESCRIPTION_MAP = {
 }
 
 
-# Nguong canh bao khi confidence qua cao (co the chua calibrate)
+# Warning threshold for when confidence is unusually high (may be uncalibrated)
 CONFIDENCE_CALIBRATION_THRESHOLD = float(
     os.getenv("CONFIDENCE_CALIBRATION_THRESHOLD", "0.999")
 )
@@ -121,8 +121,8 @@ def _maybe_escalate_severity(
     confidence: float,
 ) -> tuple:
     """
-    Escalate len "critical" neu malignant + confidence >= 0.9.
-    Downgrade xuong "significant" neu malignant + confidence < 0.5.
+    Escalates to "critical" if malignant + confidence >= 0.9.
+    Downgrades to "significant" if malignant + confidence < 0.5.
     """
     if label == "malignant":
         if confidence >= 0.9:
@@ -148,9 +148,9 @@ def map_knowledge(
         organ:      'breast' | 'thyroid'
         top_label:  'benign' | 'malignant' | 'normal'
         confidence: float [0, 1]
-        all_scores: dict từ ModelOutput
+        all_scores: dict from ModelOutput
 
-    Returns dict map 1-1 vào KnowledgeMapped schema.
+    Returns a dict mapping 1-1 into the KnowledgeMapped schema.
     """
     label = top_label.lower()
     organ = organ.lower()
@@ -201,26 +201,26 @@ def derive_spatial(
     pixel_spacing_mm: float = 0.1,
 ) -> dict:
     """
-    Wrapper sang postprocess_mask từ Vision service.
+    Wraps postprocess_mask from the Vision service.
 
-    Mask nhan qua HTTP body dang base64 PNG, khong dung path tren disk.
+    The mask is received over the HTTP body as a base64 PNG, not as a path on disk.
 
     Args:
-        mask_png_base64:  mask PNG encode base64 (từ ModelOutput.mask_png_base64)
-        original_size:    (H, W) ảnh gốc
+        mask_png_base64:  mask PNG base64-encoded (from ModelOutput.mask_png_base64)
+        original_size:    (H, W) of the original image
         organ:            'breast' | 'thyroid'
         pixel_spacing_mm: mm/pixel
 
-    Returns dict map 1-1 vào SpatialDerived schema.
+    Returns a dict mapping 1-1 into the SpatialDerived schema.
 
     Raises:
-        ValueError: neu mask khong decode duoc hoac organ khong hop le.
+        ValueError: if the mask cannot be decoded or the organ is invalid.
     """
     organ_key = organ.lower()
     fn = _POSTPROCESS_BY_ORGAN.get(organ_key)
     if fn is None:
         raise ValueError(
-            f"Không có postprocess cho organ='{organ}'. Hỗ trợ: "
+            f"No postprocess function for organ='{organ}'. Supported: "
             f"{list(_POSTPROCESS_BY_ORGAN.keys())}"
         )
     return fn(

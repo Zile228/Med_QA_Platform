@@ -4,21 +4,22 @@ services/orchestrator/main.py
 FastAPI Orchestrator -- Layer 4 Gateway | port 8000
 
 Endpoints:
-    POST /analyze  -- nhan anh + question -> ReportOutput
-    POST /chat     -- hoi them ve ket qua da phan tich (multi-turn)
+    POST /analyze  -- takes an image + question -> ReportOutput
+    POST /chat     -- ask follow-up questions about analyzed results (multi-turn)
     GET  /health
     GET  /metrics  -- Prometheus metrics
 
-/chat yeu cau image_id da duoc /analyze truoc do. Context duoc cache
-trong bo nho process (in-memory dict voi TTL). Gioi han nay phai duoc
-ghi nhan ro: khong hoat dong voi orchestrator scale > 1 replica -- can
-Redis/DB that cho multi-instance deploy.
+/chat requires an image_id that was already passed to /analyze. Context is
+cached in process memory (in-memory dict with TTL). This limitation must be
+clearly noted: it does not work with orchestrator scaled to > 1 replica --
+a real Redis/DB is needed for multi-instance deployment.
 """
 
 import os
 import sys
 import time
 import asyncio
+import logging
 from contextlib import asynccontextmanager
 from typing import Optional, List
 
@@ -31,6 +32,9 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
 from shared.schemas import ReportOutput, Tier1Structured, RagSource, CoTResult
 from shared.telemetry import setup_tracing, get_tracer
+from shared.image_validation import (
+    check_upload_size, ImageValidationError
+)
 from services.orchestrator.llm_client import get_llm_client
 from services.orchestrator.rag.faiss_store import FAISSStore
 from services.orchestrator.graph import (
@@ -39,30 +43,36 @@ from services.orchestrator.graph import (
 )
 from services.orchestrator.module_registry import load_module_registry, ModuleRegistryError
 
+logger = logging.getLogger(__name__)
+
 try:
     from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
     PROM_AVAILABLE = True
     _analyze_latency = Histogram(
         "orchestrator_analyze_duration_seconds",
-        "Latency end-to-end cua /analyze",
+        "End-to-end latency of /analyze",
         buckets=[0.5, 1.0, 2.0, 5.0, 10.0, 30.0, 60.0],
     )
     _analyze_counter = Counter(
         "orchestrator_analyze_requests_total",
-        "Tong so request /analyze",
+        "Total number of /analyze requests",
         ["organ", "label", "status"],
     )
     _ood_counter = Counter(
         "orchestrator_ood_rejections_total",
-        "So request bi reject vi OOD",
+        "Number of requests rejected due to OOD",
     )
     _consensus_false_counter = Counter(
         "orchestrator_consensus_false_total",
-        "So request co bat dong mapper vs CoT (consensus=false)",
+        "Number of requests with mapper vs CoT disagreement (consensus=false)",
+    )
+    _icd10_disagreement_counter = Counter(
+        "orchestrator_icd10_disagreement_total",
+        "Number of requests with differing icd10_hint between mapper vs CoT (icd10_agreement=false)",
     )
     _confidence_histogram = Histogram(
         "vision_confidence_score",
-        "Phan phoi confidence score tu vision model",
+        "Distribution of confidence scores from the vision model",
         buckets=[0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 1.0],
     )
 except ImportError:
@@ -100,7 +110,7 @@ async def lifespan(app: FastAPI):
     rag_store   = FAISSStore(index_path=FAISS_INDEX_PATH)
 
     if not rag_store.is_ready():
-        print("[orchestrator] RAG index not ready -- LLM se chay khong co clinical context.")
+        print("[orchestrator] RAG index not ready -- LLM will run without clinical context.")
 
     _graph = build_graph(SERVICES_CFG, _llm_client, rag_store, registry=_registry)
     print(f"[orchestrator] Graph ready -- services: {SERVICES_CFG}")
@@ -114,13 +124,13 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Med-Platform Orchestrator",
-    description="Layer 4 -- LangGraph gateway. Dieu phoi router -> vision -> knowledge -> LLM.",
+    description="Layer 4 -- LangGraph gateway. Orchestrates router -> vision -> knowledge -> LLM.",
     version="1.0.0",
     lifespan=lifespan,
 )
 
 
-# Schema cho /chat endpoint
+# Schema for the /chat endpoint
 
 class ChatMessage(BaseModel):
     role: str
@@ -138,10 +148,10 @@ class ChatResponse(BaseModel):
     image_id: str
 
 
-# Quan ly context cache theo image_id
+# Manage the context cache by image_id
 
 def _save_context(image_id: str, report_dict: dict, rag_chunks: list):
-    """Luu context vao cache sau khi /analyze thanh cong."""
+    """Save context into the cache after /analyze succeeds."""
     _context_cache[image_id] = {
         "context": {
             "image_id": image_id,
@@ -154,16 +164,16 @@ def _save_context(image_id: str, report_dict: dict, rag_chunks: list):
 
 def _get_context(image_id: str) -> dict:
     """
-    Lay context tu cache theo image_id.
-    Raise HTTPException 404 neu chua analyze hoac da het TTL.
+    Get context from the cache by image_id.
+    Raises HTTPException 404 if not analyzed yet or the TTL has expired.
     """
     entry = _context_cache.get(image_id)
     if entry is None:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"image_id '{image_id}' chua duoc phan tich hoac khong ton tai. "
-                "Vui long goi /analyze truoc."
+                f"image_id '{image_id}' has not been analyzed or does not exist. "
+                "Please call /analyze first."
             ),
         )
     age = time.time() - entry["ts"]
@@ -172,8 +182,8 @@ def _get_context(image_id: str) -> dict:
         raise HTTPException(
             status_code=404,
             detail=(
-                f"Context cho image_id '{image_id}' da het han ({_CONTEXT_TTL_SECONDS}s). "
-                "Vui long upload va phan tich lai anh."
+                f"Context for image_id '{image_id}' has expired ({_CONTEXT_TTL_SECONDS}s). "
+                "Please upload and analyze the image again."
             ),
         )
     return entry
@@ -198,34 +208,39 @@ def health():
 def metrics():
     """Prometheus metrics endpoint."""
     if not PROM_AVAILABLE:
-        return PlainTextResponse("# prometheus_client chua install\n", status_code=200)
+        return PlainTextResponse("# prometheus_client not installed\n", status_code=200)
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/analyze", response_model=ReportOutput)
 async def analyze(
-    image: UploadFile = File(..., description="Anh ultrasound PNG/JPG"),
+    image: UploadFile = File(..., description="Ultrasound image PNG/JPG"),
     question: str = Form(
         default="What are the findings in this ultrasound image?",
-        description="Cau hoi lam sang",
+        description="Clinical question",
     ),
     image_id: str = Form(default=None, description="Optional custom image ID"),
     modality_hint: Optional[str] = Form(default=None, description="'breast' | 'thyroid' | None"),
     organ_hint: Optional[str] = Form(default=None, description="'breast' | 'thyroid' | None"),
 ):
     """
-    Entry point chinh cho client / Gradio UI.
+    Main entry point for the client / Gradio UI.
 
-    modality_hint va organ_hint duoc forward xuong router -- router ket hop
-    voi router_probs theo trong so de ra quyet dinh cuoi. Hint conflict
-    duoc ghi ro trong Tier1Structured.hint_conflict va hint_resolution_note.
+    modality_hint and organ_hint are forwarded to the router -- the router
+    combines them with router_probs by weight to reach the final decision.
+    Hint conflicts are recorded in Tier1Structured.hint_conflict and
+    hint_resolution_note.
     """
     if _graph is None:
-        raise HTTPException(status_code=503, detail="Orchestrator chua san sang.")
+        raise HTTPException(status_code=503, detail="Orchestrator not ready.")
 
     image_bytes = await image.read()
     if not image_bytes:
-        raise HTTPException(status_code=400, detail="File anh rong.")
+        raise HTTPException(status_code=400, detail="Empty image file.")
+    try:
+        check_upload_size(image_bytes)
+    except ImageValidationError as e:
+        raise HTTPException(status_code=413, detail=str(e))
 
     t_start = time.perf_counter()
     with get_tracer().start_as_current_span("orchestrator.analyze") as span:
@@ -245,6 +260,7 @@ async def analyze(
             span.set_attribute("result.label",      t1_data.get("label", ""))
             span.set_attribute("result.severity",   t1_data.get("severity", ""))
             span.set_attribute("result.consensus",  str(report_dict.get("consensus")))
+            span.set_attribute("result.icd10_agreement", str(report_dict.get("icd10_agreement")))
         except RuntimeError as e:
             err_str = str(e)
             span.record_exception(e)
@@ -257,7 +273,8 @@ async def analyze(
             span.record_exception(e)
             if PROM_AVAILABLE:
                 _analyze_counter.labels(organ="unknown", label="unknown", status="error").inc()
-            raise HTTPException(status_code=500, detail=f"Pipeline error: {str(e)}")
+            logger.exception("Pipeline failed")
+            raise HTTPException(status_code=500, detail="Internal error during pipeline execution. Check server logs.")
 
     if PROM_AVAILABLE:
         elapsed = time.perf_counter() - t_start
@@ -270,6 +287,8 @@ async def analyze(
         _confidence_histogram.observe(conf)
         if report_dict.get("consensus") is False:
             _consensus_false_counter.inc()
+        if report_dict.get("icd10_agreement") is False:
+            _icd10_disagreement_counter.inc()
 
     _save_context(
         report_dict["image_id"],
@@ -279,7 +298,7 @@ async def analyze(
 
     t1 = report_dict["tier_1_structured"]
 
-    # Chuyen rag_sources tu list dict sang list RagSource
+    # Convert rag_sources from a list of dicts to a list of RagSource
     raw_sources = report_dict.get("rag_sources", [])
     rag_sources = []
     for src in raw_sources:
@@ -289,7 +308,7 @@ async def analyze(
                 page=src.get("page", 0),
             ))
 
-    # Chuyen cot_result tu dict sang CoTResult neu co
+    # Convert cot_result from dict to CoTResult if present
     cot_raw = report_dict.get("cot_result")
     cot_result = None
     if cot_raw and isinstance(cot_raw, dict) and cot_raw.get("severity") != "undetermined":
@@ -301,9 +320,10 @@ async def analyze(
     try:
         tier1_obj = Tier1Structured(**t1)
     except Exception as e:
+        logger.exception("Tier1Structured validation failed -- missing field in pipeline output")
         raise HTTPException(
             status_code=500,
-            detail=f"Tier1Structured validation error -- thieu field trong pipeline output: {e}",
+            detail="Internal error building report. Check server logs.",
         )
 
     return ReportOutput(
@@ -316,19 +336,21 @@ async def analyze(
         mapper_result=report_dict.get("mapper_result"),
         cot_result=cot_result,
         consensus=report_dict.get("consensus"),
+        icd10_agreement=report_dict.get("icd10_agreement"),
     )
 
 
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
     """
-    Multi-turn chatbot dua tren context da phan tich.
+    Multi-turn chatbot built on already-analyzed context.
 
-    Khong nhan lai anh -- tai su dung context tu _context_cache theo image_id.
-    Vision/router/knowledge KHONG duoc goi lai -- chi goi LLM voi context + history.
+    Does not take the image again -- reuses context from _context_cache by
+    image_id. Vision/router/knowledge are NOT called again -- only the LLM
+    is called with context + history.
     """
     if _llm_client is None:
-        raise HTTPException(status_code=503, detail="LLM client chua san sang.")
+        raise HTTPException(status_code=503, detail="LLM client not ready.")
 
     entry = _get_context(req.image_id)
     unified_context = entry["context"]
@@ -348,6 +370,7 @@ async def chat(req: ChatRequest):
             _llm_client.generate, prompt, CHAT_SYSTEM_PROMPT
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM error: {str(e)}")
+        logger.exception("Chat LLM call failed")
+        raise HTTPException(status_code=500, detail="Internal error during chat. Check server logs.")
 
     return ChatResponse(reply=reply, image_id=req.image_id)

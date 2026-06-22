@@ -1,5 +1,5 @@
-# Module Registry — mỗi entry = 1 service
-# Orchestrator đọc file này để biết gọi service nào cho modality nào
+# Module Registry - each entry = 1 service
+# The orchestrator reads this file to know which service to call for which modality
 
 version: "1.0"
 
@@ -14,13 +14,13 @@ services:
     modalities:
       us_breast:
         endpoint: "/analyze/us_breast"
-        description: "Breast US — MedSAM segment + MTL classify"
+        description: "Breast US - EfficientNet-B4 segment + MTL classify"
       us_thyroid:
         endpoint: "/analyze/us_thyroid"
-        description: "Thyroid US — MedSAM segment + TI-RADS features"
+        description: "Thyroid US - EfficientNet-B4 segment + TI-RADS features"
       xray:
         endpoint: "/analyze/xray"
-        description: "X-Ray — Phase 2 (not implemented)"
+        description: "X-Ray - Phase 2 (not implemented)"
         enabled: false
 
   knowledge:
@@ -31,4 +31,4 @@ services:
   orchestrator:
     url: "http://orchestrator:8000"
     endpoint: "/analyze"
-    description: "LangGraph gateway — coordinates all services"
+    description: "LangGraph gateway - coordinates all services"

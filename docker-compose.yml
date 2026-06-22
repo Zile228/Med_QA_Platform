@@ -1,11 +1,49 @@
 services:
 
+  ollama:
+    image: ollama/ollama:latest
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    # GPU passthrough (uncomment if running on a host with an NVIDIA GPU + nvidia-container-toolkit):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  ollama-pull:
+    image: ollama/ollama:latest
+    volumes:
+      - ollama_data:/root/.ollama
+    environment:
+      - OLLAMA_HOST=http://ollama:11434
+    env_file: .env
+    entrypoint: >
+      sh -c "
+        echo '[ollama-pull] Waiting for Ollama daemon...';
+        until ollama list > /dev/null 2>&1; do sleep 2; done;
+        echo '[ollama-pull] Pulling model: $${OLLAMA_MODEL:-phi4-mini}';
+        ollama pull $${OLLAMA_MODEL:-phi4-mini};
+        echo '[ollama-pull] Done.';
+      "
+    depends_on:
+      ollama:
+        condition: service_healthy
+    restart: "no"
+
   router:
     build:
       context: .
       dockerfile: services/router/Dockerfile
-    ports:
-      - "${ROUTER_PORT:-8001}:8001"
     env_file: .env
     environment:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
@@ -23,8 +61,6 @@ services:
     build:
       context: .
       dockerfile: services/vision/Dockerfile
-    ports:
-      - "${VISION_PORT:-8002}:8002"
     env_file: .env
     environment:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
@@ -43,8 +79,6 @@ services:
     build:
       context: .
       dockerfile: services/knowledge/Dockerfile
-    ports:
-      - "${KNOWLEDGE_PORT:-8003}:8003"
     env_file: .env
     environment:
       - OTEL_EXPORTER_OTLP_ENDPOINT=http://jaeger:4317
@@ -74,6 +108,8 @@ services:
       - vision
       - knowledge
       - jaeger
+      - ollama
+      - ollama-pull     
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -128,7 +164,7 @@ services:
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD:-admin}
+      - GF_SECURITY_ADMIN_PASSWORD=${GRAFANA_PASSWORD}
       - GF_USERS_ALLOW_SIGN_UP=false
     volumes:
       - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
@@ -143,3 +179,4 @@ services:
 
 volumes:
   grafana_data:
+  ollama_data:

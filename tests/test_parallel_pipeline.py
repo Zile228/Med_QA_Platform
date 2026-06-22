@@ -1,5 +1,5 @@
 """
-Test cho pipeline song song (vision + rag + cot), merge_node, consistency_guard, qa_agent_node.
+Tests for the parallel pipeline (vision + rag + cot), merge_node, consistency_guard, qa_agent_node.
 """
 
 import asyncio
@@ -48,6 +48,7 @@ def _base_state(**overrides) -> dict:
         "rag_chunks":    [],
         "rag_meta":      [],
         "consensus":     None,
+        "icd10_agreement": None,
         "report":        None,
         "error":         None,
     }
@@ -58,7 +59,7 @@ def _base_state(**overrides) -> dict:
 # Mock RAG store
 
 class MockRAGStore:
-    """RAG store gia lap - ghi lai query duoc truyen vao."""
+    """Mock RAG store - records the query passed in."""
 
     def __init__(self, chunks=None, latency=0.0):
         self.chunks = chunks or ["chunk A", "chunk B"]
@@ -91,8 +92,8 @@ class MockRAGStore:
 
 def test_rag_node_query_uses_user_question_not_classification_label():
     """
-    rag_node phai dung question goc cua user lam query, KHONG dung
-    organ/top_label (vi luc do vision chua chay xong).
+    rag_node must use the user's original question as the query, NOT
+    organ/top_label (since vision hasn't finished running yet at that point).
     """
     store = MockRAGStore()
     rag_node = make_rag_node(store)
@@ -126,10 +127,10 @@ def test_rag_node_skips_when_error_already_set():
     rag_node = make_rag_node(store)
     state = _base_state(error="upstream error")
     asyncio.run(rag_node(state))
-    assert store.last_query is None    # retrieve khong bi goi
+    assert store.last_query is None    # retrieve was not called
 
 
-# CoT node -- regression test cho bug spatial=None gay AttributeError
+# CoT node -- regression test for the spatial=None bug causing AttributeError
 
 class MockLLMForCoT:
     def generate(self, prompt, system=None):
@@ -139,17 +140,17 @@ class MockLLMForCoT:
 
 def test_cot_node_handles_spatial_none_without_crashing():
     """
-    Regression test: cot_reasoning_node chay song song voi knowledge_node.
-    Neu cot_node toi truoc khi knowledge_node kip set state['spatial'], gia tri
-    nay van con la None (gia tri khoi tao trong OrchestratorState) -- KHONG phai {}.
-    state.get('spatial', {}) khong bat duoc truong hop nay vi key 'spatial' van
-    ton tai voi gia tri None. Truoc khi sua, dieu nay gay AttributeError ben trong
-    _build_cot_prompt khi goi spatial.get(...) tren None, lam crash toan bo /analyze
-    voi 500 Internal Server Error.
+    Regression test: cot_reasoning_node runs in parallel with knowledge_node.
+    If cot_node runs before knowledge_node has a chance to set state['spatial'],
+    that value is still None (the initial value in OrchestratorState) -- NOT {}.
+    state.get('spatial', {}) does not catch this case since the key 'spatial'
+    still exists with value None. Before the fix, this caused an AttributeError
+    inside _build_cot_prompt when calling spatial.get(...) on None, crashing the
+    entire /analyze with a 500 Internal Server Error.
     """
     cot_node = make_cot_node(MockLLMForCoT())
     state = _base_state(
-        spatial=None,      # mo phong dung truong hop knowledge_node chua chay xong
+        spatial=None,      # simulates the exact case where knowledge_node hasn't run yet
         knowledge=None,
     )
     result = asyncio.run(cot_node(state))
@@ -157,7 +158,7 @@ def test_cot_node_handles_spatial_none_without_crashing():
 
 
 def test_cot_node_handles_routing_none_without_crashing():
-    """Tuong tu test tren nhung cho field routing=None."""
+    """Same as the test above but for field routing=None."""
     cot_node = make_cot_node(MockLLMForCoT())
     state = _base_state(routing=None)
     result = asyncio.run(cot_node(state))
@@ -199,7 +200,7 @@ def test_merge_node_sets_error_when_knowledge_missing():
 def test_consistency_guard_consensus_true_when_levels_match():
     store = MockRAGStore()
     guard = make_consistency_guard_node(store)
-    # Mapper: level 2, CoT: level 2 -> dong thuan
+    # Mapper: level 2, CoT: level 2 -> agreement
     state = _base_state(
         cot_result={"severity": "significant", "severity_level": 2,
                     "icd10_hint": "N63.0", "risk_category": "BI-RADS 3",
@@ -212,7 +213,7 @@ def test_consistency_guard_consensus_true_when_levels_match():
 def test_consistency_guard_consensus_false_when_levels_differ_much():
     store = MockRAGStore()
     guard = make_consistency_guard_node(store)
-    # Mapper: level 2, CoT: level 4 -> bat dong (chenh 2)
+    # Mapper: level 2, CoT: level 4 -> disagreement (differ by 2)
     state = _base_state(
         cot_result={"severity": "critical", "severity_level": 4,
                     "icd10_hint": "C50.9", "risk_category": "BI-RADS 5",
@@ -220,6 +221,81 @@ def test_consistency_guard_consensus_false_when_levels_differ_much():
     )
     result = asyncio.run(guard(state))
     assert result["consensus"] is False
+
+
+def test_icd10_agreement_false_when_codes_differ_even_if_levels_match():
+    """
+    Mapper and CoT have the same severity_level but different icd10_hint
+    (benign vs malignant) -> consensus is still True (severity only) but
+    icd10_agreement must be False since this is an independent clinical question.
+    """
+    store = MockRAGStore()
+    guard = make_consistency_guard_node(store)
+    # Mapper: level 2, icd10 N63.0 (benign). CoT: level 2, icd10 C50.9 (malignant).
+    state = _base_state(
+        cot_result={"severity": "significant", "severity_level": 2,
+                    "icd10_hint": "C50.9", "risk_category": "BI-RADS 5",
+                    "reasoning": "test"},
+    )
+    result = asyncio.run(guard(state))
+    assert result["consensus"] is True
+    assert result["icd10_agreement"] is False
+
+
+def test_icd10_agreement_true_when_codes_match():
+    store = MockRAGStore()
+    guard = make_consistency_guard_node(store)
+    state = _base_state(
+        cot_result={"severity": "significant", "severity_level": 2,
+                    "icd10_hint": "N63.0", "risk_category": "BI-RADS 3",
+                    "reasoning": "test"},
+    )
+    result = asyncio.run(guard(state))
+    assert result["icd10_agreement"] is True
+
+
+class MockLLMForQA:
+    def generate(self, prompt, system=None):
+        return "TIER 2 -- test description\nTIER 3 -- test suggestion"
+
+
+def test_qa_agent_node_surfaces_both_icd10_codes_when_disagreement():
+    """
+    When icd10_agreement is False, the final report must contain both ICD-10
+    codes (not just keep the mapper's code) and tier_1_structured.icd10_hint
+    must be the concatenation of both, exactly as required in TODO.md item 3.
+    """
+    qa_agent_node = make_qa_agent_node(MockLLMForQA(), MockRAGStore())
+    state = _base_state(
+        consensus=True,
+        icd10_agreement=False,
+        cot_result={"severity": "significant", "severity_level": 2,
+                    "icd10_hint": "C50.9", "risk_category": "BI-RADS 5",
+                    "reasoning": "test"},
+    )
+    result = asyncio.run(qa_agent_node(state))
+    report = result["report"]
+
+    assert report["icd10_agreement"] is False
+    assert "N63.0" in report["tier_1_structured"]["icd10_hint"]
+    assert "C50.9" in report["tier_1_structured"]["icd10_hint"]
+    assert report["mapper_result"]["icd10_hint"] == "N63.0"
+    assert report["cot_result"]["icd10_hint"] == "C50.9"
+
+
+def test_qa_agent_node_single_icd10_when_codes_agree():
+    qa_agent_node = make_qa_agent_node(MockLLMForQA(), MockRAGStore())
+    state = _base_state(
+        consensus=True,
+        icd10_agreement=True,
+        cot_result={"severity": "significant", "severity_level": 2,
+                    "icd10_hint": "N63.0", "risk_category": "BI-RADS 3",
+                    "reasoning": "test"},
+    )
+    result = asyncio.run(qa_agent_node(state))
+    report = result["report"]
+
+    assert report["tier_1_structured"]["icd10_hint"] == "N63.0"
 
 
 def test_consistency_guard_consensus_none_when_cot_undetermined():
@@ -232,14 +308,15 @@ def test_consistency_guard_consensus_none_when_cot_undetermined():
     )
     result = asyncio.run(guard(state))
     assert result["consensus"] is None
+    assert result["icd10_agreement"] is None
 
 
 def test_consistency_guard_handles_knowledge_none_without_crashing():
     """
-    Regression test: neu fan-in chua hoan tat dung va consistency_guard chay
-    truoc khi knowledge_node kip set state, state['knowledge'] van la None
-    (gia tri khoi tao). second_retrieve va consistency_guard phai khong crash
-    trong truong hop nay, chi tra ve consensus=None thay vi raise AttributeError.
+    Regression test: if the fan-in hasn't completed correctly and consistency_guard
+    runs before knowledge_node has a chance to set state, state['knowledge'] is
+    still None (the initial value). second_retrieve and consistency_guard must
+    not crash in this case, just return consensus=None instead of raising AttributeError.
     """
     store = MockRAGStore()
     guard = make_consistency_guard_node(store)
@@ -251,16 +328,18 @@ def test_consistency_guard_handles_knowledge_none_without_crashing():
                     "icd10_hint": "N63.0", "risk_category": "low", "reasoning": "x"},
     )
     result = asyncio.run(guard(state))
-    # mapper_level mac dinh 0, cot_level=1 -> chenh lech 1 -> consensus True
+    # mapper_level defaults to 0, cot_level=1 -> differs by 1 -> consensus True
     assert result["consensus"] is True
+    # knowledge=None so there is no icd10_hint to compare -> icd10_agreement None
+    assert result["icd10_agreement"] is None
 
 
-# Concurrency: vision va rag chay song song
+# Concurrency: vision and rag run in parallel
 
 def test_vision_and_rag_nodes_run_concurrently():
     """
-    Moi nhanh gia lap 0.3s latency. Neu song song thi tong thoi gian ~ 0.3s.
-    Neu tuan tu thi ~ 0.6s. Assert tong < 0.5s chung minh song song that su.
+    Each branch simulates 0.3s latency. If run in parallel, total time is ~0.3s.
+    If sequential, ~0.6s. Asserting total < 0.5s proves real parallelism.
     """
     LATENCY = 0.3
     store = MockRAGStore(latency=LATENCY)
@@ -283,7 +362,7 @@ def test_vision_and_rag_nodes_run_concurrently():
 
     elapsed, _, rag_result = asyncio.run(run())
     assert elapsed < LATENCY * 1.8, (
-        f"Hai nhanh mat {elapsed:.2f}s -- qua lau, co ve chay tuan tu"
+        f"The two branches took {elapsed:.2f}s -- too long, looks sequential"
     )
     assert rag_result["rag_chunks"]
 
@@ -292,8 +371,8 @@ def test_vision_and_rag_nodes_run_concurrently():
 
 def test_sequential_fallback_runs_both_rag_and_image_branches():
     """
-    Khi langgraph khong install, AsyncSequentialFallback van phai chay
-    ca rag_node lan image/knowledge branch - khong bo nhanh nao.
+    When langgraph is not installed, AsyncSequentialFallback must still run
+    both the rag_node and the image/spatial/knowledge branch - no branch skipped.
     """
     rag_store = MockRAGStore(chunks=["guideline_1"])
 
@@ -305,9 +384,12 @@ def test_sequential_fallback_runs_both_rag_and_image_branches():
         state["model_output"] = _base_state()["model_output"]
         return state
 
+    async def fake_spatial(state):
+        state["spatial"] = _base_state()["spatial"]
+        return state
+
     async def fake_knowledge(state):
         state["knowledge"] = _base_state()["knowledge"]
-        state["spatial"]   = _base_state()["spatial"]
         return state
 
     class MockLLM:
@@ -315,8 +397,8 @@ def test_sequential_fallback_runs_both_rag_and_image_branches():
             return "TIER 2 findings\nTIER 3 suggestion"
 
     fb = AsyncSequentialFallback(
-        image_nodes=[fake_route, fake_vision, fake_knowledge],
-        cot_node=make_rag_node(rag_store),      # stub nhanh CoT bang rag_node cho don gian
+        image_nodes=[fake_route, fake_vision, fake_spatial, fake_knowledge],
+        cot_node=make_rag_node(rag_store),      # stub the CoT branch with rag_node for simplicity
         rag_node=make_rag_node(rag_store),
         merge_node=make_merge_node(),
         consistency_guard_node=make_consistency_guard_node(rag_store),
@@ -332,8 +414,71 @@ def test_sequential_fallback_runs_both_rag_and_image_branches():
     assert result.get("report") is not None
 
 
+def test_sequential_fallback_cot_does_not_see_knowledge_before_reasoning():
+    """
+    Regression test for a real bug: cot_node must run on a state snapshot
+    taken BEFORE knowledge_node executes, exactly like the real LangGraph
+    edges (spatial -> {knowledge, cot_reasoning} in parallel). If cot_node
+    sees state["knowledge"] already populated, it is no longer an
+    independent assessment -- it could anchor on the mapper's answer,
+    silently defeating the whole point of comparing two independent
+    opinions (consensus / icd10_agreement).
+    """
+    rag_store = MockRAGStore()
+
+    async def fake_route(state):
+        state["routing"] = {"organ": "breast", "modality": "ultrasound"}
+        return state
+
+    async def fake_vision(state):
+        state["model_output"] = {"top_label": "malignant", "confidence": 0.9}
+        return state
+
+    async def fake_spatial(state):
+        state["spatial"] = {"area_cm2": 1.0}
+        return state
+
+    async def fake_knowledge(state):
+        state["knowledge"] = {"severity": "critical", "icd10_hint": "C50.9"}
+        return state
+
+    captured = {}
+
+    async def fake_cot(state):
+        captured["saw_knowledge"] = state.get("knowledge") is not None
+        captured["saw_spatial"] = state.get("spatial") is not None
+        state["cot_result"] = {"severity": "undetermined"}
+        return state
+
+    class MockLLM:
+        def generate(self, prompt, system=None):
+            return "TIER 2 findings\nTIER 3 suggestion"
+
+    fb = AsyncSequentialFallback(
+        image_nodes=[fake_route, fake_vision, fake_spatial, fake_knowledge],
+        cot_node=fake_cot,
+        rag_node=make_rag_node(rag_store),
+        merge_node=make_merge_node(),
+        consistency_guard_node=make_consistency_guard_node(rag_store),
+        qa_agent_node=make_qa_agent_node(MockLLM(), rag_store),
+    )
+
+    state = _base_state(routing=None, model_output=None, knowledge=None, spatial=None)
+    result = asyncio.run(fb.ainvoke(state))
+
+    assert captured["saw_knowledge"] is False, (
+        "cot_node saw state['knowledge'] before reasoning -- it must run "
+        "independently of the mapper, exactly like the real LangGraph edges."
+    )
+    assert captured["saw_spatial"] is True, (
+        "cot_node should still see spatial -- it needs spatial features to reason."
+    )
+    # knowledge must still end up in the final state once both branches finish
+    assert result.get("knowledge") is not None
+
+
 def test_sequential_fallback_propagates_error_and_skips_llm():
-    """Neu nhanh image loi, merge va qa_agent_node khong duoc goi."""
+    """If the image branch fails, merge and qa_agent_node must not be called."""
     called = {"qa": False}
 
     async def fail_route(state):

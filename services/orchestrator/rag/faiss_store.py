@@ -1,14 +1,14 @@
 """
 services/orchestrator/rag/faiss_store.py
 ==========================================
-FAISS-based RAG retrieval cho clinical documents.
+FAISS-based RAG retrieval for clinical documents.
 
 Workflow:
-  1. Build (offline):   scripts/build_vectordb.py chay 1 lan, index PDFs -> disk
+  1. Build (offline):   scripts/build_vectordb.py runs once, indexes PDFs -> disk
   2. Retrieve (online): FAISSStore.retrieve(...) -> List[str]
 
-Metadata (source_file, page_number, organ) duoc load tu metadata.pkl neu co.
-Index cu (khong co metadata.pkl) van hoat dong -- fallback tra ve chunk text thuan.
+Metadata (source_file, page_number, organ) is loaded from metadata.pkl if present.
+An old index (without metadata.pkl) still works -- falls back to returning plain chunk text.
 
 Public API:
     FAISSStore(index_path, docs_path)
@@ -24,10 +24,10 @@ from typing import List, Optional
 
 class FAISSStore:
     """
-    Load FAISS index tu disk -> retrieve top-k chunks cho query.
+    Loads a FAISS index from disk -> retrieves top-k chunks for a query.
 
-    Neu index chua ton tai -> is_ready() = False -> orchestrator
-    fallback sang empty context (LLM van chay, khong crash).
+    If the index does not exist yet -> is_ready() = False -> the orchestrator
+    falls back to an empty context (the LLM still runs, no crash).
     """
 
     def __init__(
@@ -56,12 +56,12 @@ class FAISSStore:
         self._try_load()
 
     def _try_load(self):
-        """Load FAISS index, chunks va metadata tu disk. Khong throw neu chua co."""
+        """Loads the FAISS index, chunks, and metadata from disk. Does not throw if missing."""
         try:
             import faiss
             if not os.path.exists(self.index_path):
-                print(f"[rag] Index chua ton tai: {self.index_path}")
-                print("[rag] Chay scripts/build_vectordb.py de build index.")
+                print(f"[rag] Index does not exist yet: {self.index_path}")
+                print("[rag] Run scripts/build_vectordb.py to build the index.")
                 return
 
             self._index = faiss.read_index(self.index_path)
@@ -74,7 +74,7 @@ class FAISSStore:
                 with open(self.metadata_path, "rb") as f:
                     self._metadata = pickle.load(f)
             else:
-                # Index cu khong co metadata: tao placeholder de khong crash
+                # Old index without metadata: create a placeholder to avoid crashing
                 self._metadata = [
                     {"source_file": "unknown", "page_number": 0, "organ": "general"}
                     for _ in self._chunks
@@ -88,29 +88,29 @@ class FAISSStore:
             )
 
         except ImportError:
-            print("[rag] faiss-cpu chua install -> RAG disabled.")
+            print("[rag] faiss-cpu is not installed -> RAG disabled.")
         except Exception as e:
             print(f"[rag] Load failed: {e} -> RAG disabled.")
 
     def _load_embedder(self):
-        """Load embedding model."""
+        """Load the embedding model."""
         try:
             from sentence_transformers import SentenceTransformer
             self._embedder = SentenceTransformer(self.embedding_model_name)
         except ImportError:
-            print("[rag] sentence-transformers chua install -> RAG disabled.")
+            print("[rag] sentence-transformers is not installed -> RAG disabled.")
 
     def _load_cross_encoder(self):
         """
-        Load cross-encoder model 1 lan khi khoi dong, cache vao self._cross_encoder.
-        Neu chua install, self._cross_encoder = None va rerank() fallback ve thu tu goc.
+        Loads the cross-encoder model once at startup, caches it in self._cross_encoder.
+        If not installed, self._cross_encoder = None and rerank() falls back to the original order.
         """
         try:
             from sentence_transformers import CrossEncoder
             self._cross_encoder = CrossEncoder(self.cross_encoder_model_name)
             print(f"[rag] CrossEncoder loaded: {self.cross_encoder_model_name}")
         except ImportError:
-            print("[rag] cross-encoder chua install -> rerank disabled, dung thu tu FAISS score.")
+            print("[rag] cross-encoder is not installed -> rerank disabled, using raw FAISS score order.")
         except Exception as e:
             print(f"[rag] CrossEncoder load error: {e} -> rerank disabled.")
 
@@ -128,8 +128,8 @@ class FAISSStore:
 
     def _filter_by_organ(self, indices, distances, organ_filter: Optional[str]):
         """
-        Giu lai cac chunk co metadata.organ khop voi organ_filter hoac la "general".
-        Neu organ_filter la None, tra ve tat ca (khong loc).
+        Keeps chunks whose metadata.organ matches organ_filter or is "general".
+        If organ_filter is None, returns everything (no filtering).
         """
         if organ_filter is None:
             return [
@@ -156,15 +156,15 @@ class FAISSStore:
         organ_filter: Optional[str] = None,
     ) -> List[str]:
         """
-        Retrieve top-k chunks lien quan den query.
+        Retrieve the top-k chunks relevant to the query.
 
         Args:
-            query:        clinical question hoac finding description
-            k:            so chunks tra ve
-            organ_filter: 'breast' | 'thyroid' | None (khong loc)
+            query:        clinical question or finding description
+            k:            number of chunks to return
+            organ_filter: 'breast' | 'thyroid' | None (no filtering)
 
         Returns:
-            List[str] - text chunks, empty list neu RAG khong san sang
+            List[str] - text chunks, empty list if RAG is not ready
         """
         metas = self.retrieve_with_meta(query, k, organ_filter)
         return [m["chunk"] for m in metas]
@@ -176,9 +176,9 @@ class FAISSStore:
         organ_filter: Optional[str] = None,
     ) -> List[dict]:
         """
-        Retrieve top-k chunks kem day du metadata.
+        Retrieve the top-k chunks with full metadata.
 
-        Tra ve list dict:
+        Returns a list of dicts:
             {"chunk": str, "source_file": str, "page_number": int, "organ": str}
         """
         if not self.is_ready():
@@ -186,7 +186,7 @@ class FAISSStore:
 
         try:
             query_vec = self._embed_query(query)
-            # Tim nhieu hon k de co du ung vien sau khi loc theo organ
+            # Search for more than k to have enough candidates after organ filtering
             search_k = min(k * 5, self._index.ntotal)
             distances, indices = self._index.search(query_vec, search_k)
 
@@ -218,10 +218,10 @@ class FAISSStore:
 
     def rerank(self, query: str, candidates: List[dict], top_n: int = 3) -> List[dict]:
         """
-        Re-rank danh sach chunk bang cross-encoder da duoc cache, giu lai top_n cao nhat.
+        Re-ranks the chunk list using the cached cross-encoder, keeps the top_n highest.
 
-        candidates: list dict tu retrieve_with_meta (co field "chunk").
-        Fallback ve thu tu FAISS score goc neu cross-encoder chua load.
+        candidates: list of dicts from retrieve_with_meta (must have a "chunk" field).
+        Falls back to the original FAISS score order if the cross-encoder isn't loaded.
         """
         if not candidates:
             return candidates
@@ -244,7 +244,7 @@ class FAISSStore:
 
     def retrieve_with_scores(self, query: str, k: int = 3) -> List[dict]:
         """
-        Nhu retrieve() nhung kem score.
-        Dung cho debugging, khong dung trong pipeline chinh.
+        Like retrieve() but includes scores.
+        Used for debugging, not used in the main pipeline.
         """
         return self.retrieve_with_meta(query, k)

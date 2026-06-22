@@ -1,16 +1,16 @@
 """
 scripts/build_vectordb.py
 ==========================
-Offline script - chay 1 lan de index PDF lam sang vao FAISS.
+Offline script - run once to index clinical PDFs into FAISS.
 
-Moi chunk duoc luu kem metadata: source_file, page_number, organ.
-organ duoc gan tu ten file PDF:
-    - ten chua "breast" hoac "birads" -> "breast"
-    - ten chua "thyroid" hoac "tirads" -> "thyroid"
-    - con lai -> "general"
+Every chunk is stored with metadata: source_file, page_number, organ.
+organ is assigned from the PDF filename:
+    - name contains "breast" or "birads" -> "breast"
+    - name contains "thyroid" or "tirads" -> "thyroid"
+    - otherwise -> "general"
 
-Metadata nay duoc FAISSStore dung de loc theo organ (organ_filter)
-va tra ve citation (file + trang) thay vi placeholder string.
+This metadata is used by FAISSStore to filter by organ (organ_filter)
+and to return citations (file + page) instead of a placeholder string.
 
 Usage:
     python scripts/build_vectordb.py
@@ -27,20 +27,20 @@ import glob
 def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--docs_dir", default="services/orchestrator/rag/docs",
-                   help="Thu muc chua PDF lam sang")
+                   help="Directory containing clinical PDFs")
     p.add_argument("--out_dir",  default="services/orchestrator/rag/vectordb",
-                   help="Output dir cho FAISS index + chunks.pkl")
+                   help="Output dir for the FAISS index + chunks.pkl")
     p.add_argument("--chunk_size", type=int, default=400,
-                   help="So ky tu moi chunk")
+                   help="Number of characters per chunk")
     p.add_argument("--overlap",    type=int, default=50,
-                   help="Overlap giua cac chunk")
+                   help="Overlap between chunks")
     p.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2",
                    help="Embedding model")
     return p.parse_args()
 
 
 def _detect_organ(filename: str) -> str:
-    """Gan organ dua tren ten file PDF nguon."""
+    """Assigns the organ based on the source PDF filename."""
     name = filename.lower()
     if "breast" in name or "birads" in name or "bi-rads" in name:
         return "breast"
@@ -51,8 +51,8 @@ def _detect_organ(filename: str) -> str:
 
 def extract_text_by_page(pdf_path: str) -> list:
     """
-    Trich xuat text tung trang tu PDF, tra ve list dict {page, text}.
-    Tra ve list rong neu khong doc duoc.
+    Extracts text per page from the PDF, returns a list of dicts {page, text}.
+    Returns an empty list if it cannot be read.
     """
     try:
         import PyPDF2
@@ -65,12 +65,12 @@ def extract_text_by_page(pdf_path: str) -> list:
                     pages.append({"page": page_num, "text": text})
         return pages
     except Exception as e:
-        print(f"  [WARN] Khong doc duoc {pdf_path}: {e}")
+        print(f"  [WARN] Could not read {pdf_path}: {e}")
         return []
 
 
 def chunk_page(text: str, chunk_size: int, overlap: int) -> list:
-    """Chia text cua 1 trang thanh cac chunk theo chunk_size va overlap."""
+    """Splits a page's text into chunks based on chunk_size and overlap."""
     chunks = []
     start = 0
     while start < len(text):
@@ -88,11 +88,11 @@ def main():
 
     pdf_files = glob.glob(os.path.join(args.docs_dir, "**/*.pdf"), recursive=True)
     if not pdf_files:
-        print(f"[build_vectordb] Khong tim thay PDF trong {args.docs_dir}")
-        print("Dat file PDF lam sang vao thu muc docs/ roi chay lai.")
+        print(f"[build_vectordb] No PDF found in {args.docs_dir}")
+        print("Place clinical PDF files in the docs/ directory then run again.")
         sys.exit(0)
 
-    print(f"[build_vectordb] Tim thay {len(pdf_files)} PDF files")
+    print(f"[build_vectordb] Found {len(pdf_files)} PDF files")
 
     all_chunks = []
     all_metadata = []
@@ -116,15 +116,15 @@ def main():
                 })
             file_chunk_count += len(chunks)
 
-        print(f"    -> {file_chunk_count} chunks, {len(pages)} trang")
+        print(f"    -> {file_chunk_count} chunks, {len(pages)} pages")
 
-    print(f"[build_vectordb] Tong so chunk: {len(all_chunks)}")
+    print(f"[build_vectordb] Total chunks: {len(all_chunks)}")
 
     if not all_chunks:
-        print("[build_vectordb] Khong co chunk nao - kiem tra lai PDF files.")
+        print("[build_vectordb] No chunks found - check the PDF files again.")
         sys.exit(1)
 
-    print(f"[build_vectordb] Embedding voi {args.model}...")
+    print(f"[build_vectordb] Embedding with {args.model}...")
     try:
         from sentence_transformers import SentenceTransformer
     except ImportError:
@@ -148,7 +148,7 @@ def main():
         sys.exit(1)
 
     dim = embeddings.shape[1]
-    # IndexFlatIP: inner product tuong duong cosine khi vector da normalize
+    # IndexFlatIP: inner product is equivalent to cosine when vectors are normalized
     index = faiss.IndexFlatIP(dim)
     index.add(embeddings)
 
@@ -165,7 +165,7 @@ def main():
     print(f"[build_vectordb] Saved index    -> {index_path} ({index.ntotal} vectors)")
     print(f"[build_vectordb] Saved chunks   -> {chunks_path}")
     print(f"[build_vectordb] Saved metadata -> {metadata_path}")
-    print("Done! Restart orchestrator service de load index moi.")
+    print("Done! Restart the orchestrator service to load the new index.")
 
 
 if __name__ == "__main__":

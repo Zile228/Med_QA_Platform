@@ -1,22 +1,23 @@
 """
 ui/app.py
 ==========
-Gradio UI - giao dien demo cho Med-Platform.
+Gradio UI - demo interface for Med-Platform.
 
-Layout 2 cot x 2 tang:
-    Trai tren:  upload anh + dropdown hint + cau hoi + nut Analyze
-    Trai duoi:  anh annotated (bbox overlay)
-    Phai tren:  tabs [Document Report] [Raw JSON]
-    Phai duoi:  chatbot hoi-dap nhieu luot
+2-column x 2-row layout:
+    Top left:     image upload + hint dropdown + Analyze button
+    Bottom left:  annotated image (bbox overlay)
+    Top right:    tabs [Document Report] [Raw JSON]
+    Bottom right: multi-turn chatbot (the first question also goes through here)
 
-Chay:
+Run:
     python ui/app.py
-    hoac docker compose up ui
+    or docker compose up ui
 """
 
 import os
 import io
 import json
+import html
 import httpx
 import gradio as gr
 from PIL import Image, ImageDraw
@@ -39,7 +40,7 @@ EXAMPLE_QUESTIONS = [
     "What are the suspicious features in this scan?",
 ]
 
-# Map ten hien thi trong dropdown -> gia tri gui len server
+# Maps dropdown display name -> value sent to the server
 HINT_OPTIONS = {
     "Auto-detect": None,
     "Breast US":   "breast",
@@ -47,14 +48,14 @@ HINT_OPTIONS = {
 }
 
 
-# Goi API orchestrator
+# Orchestrator API calls
 
 def call_orchestrator(
     image_pil: Image.Image,
     question: str,
     organ_hint: str = None,
 ) -> dict:
-    """Gui anh + question + hint -> ReportOutput dict."""
+    """Send image + question + hint -> ReportOutput dict."""
     buf = io.BytesIO()
     image_pil.save(buf, format="PNG")
     buf.seek(0)
@@ -83,7 +84,7 @@ def call_orchestrator(
 
 def call_chat(image_id: str, message: str, history: list) -> str:
     """
-    Goi /chat voi context da co - khong gui lai anh.
+    Call /chat with the existing context - does not resend the image.
     history: list[dict] {"role": "user"|"assistant", "content": str}
     """
     with httpx.Client(timeout=REQUEST_TIMEOUT) as client:
@@ -96,12 +97,12 @@ def call_chat(image_id: str, message: str, history: list) -> str:
             },
         )
     if resp.status_code in (404, 400):
-        raise gr.Error(resp.json().get("detail", "Context khong tim thay."))
+        raise gr.Error(resp.json().get("detail", "Context not found."))
     resp.raise_for_status()
     return resp.json().get("reply", "")
 
 
-# Helper render HTML va anh
+# HTML and image rendering helpers
 
 def draw_bbox_on_image(
     image_pil: Image.Image,
@@ -109,7 +110,7 @@ def draw_bbox_on_image(
     label: str,
     color: str,
 ) -> Image.Image:
-    """Ve bounding box + label len anh goc."""
+    """Draw the bounding box + label on the original image."""
     img = image_pil.copy().convert("RGBA")
     overlay = Image.new("RGBA", img.size, (0, 0, 0, 0))
     draw = ImageDraw.Draw(overlay)
@@ -125,23 +126,23 @@ def draw_bbox_on_image(
 
 
 def _build_rag_citations_html(rag_sources: list) -> str:
-    """Render danh sach citation tu rag_sources (list dict {file, page})."""
+    """Render the citation list from rag_sources (list of dict {file, page})."""
     if not rag_sources:
         return ""
 
     items = ""
     for src in rag_sources:
         if isinstance(src, dict):
-            fname = src.get("file", "unknown")
+            fname = html.escape(src.get("file", "unknown"))
             page = src.get("page", 0)
-            items += f'<li><code>{fname}</code>, trang {page}</li>'
+            items += f'<li><code>{fname}</code>, page {page}</li>'
         else:
-            items += f"<li>{src}</li>"
+            items += f"<li>{html.escape(str(src))}</li>"
 
     return f"""
 <div style="margin-top:10px; padding:10px 14px; background:#1a1a2e;
             border-left:4px solid #585b70; border-radius:4px; font-size:11px; color:#a6adc8;">
-  <b>Nguon tham khao (RAG):</b>
+  <b>References (RAG):</b>
   <ul style="margin:4px 0 0 16px; padding:0;">{items}</ul>
 </div>
 """
@@ -149,13 +150,14 @@ def _build_rag_citations_html(rag_sources: list) -> str:
 
 def build_warning_banners(report: dict, t1: dict) -> str:
     """
-    Tra ve HTML chuoi cac banner canh bao de dat len dau Document Report.
-    Clinician phai thay canh bao truoc khi doc noi dung findings.
+    Return the HTML string of warning banners placed at the top of the
+    Document Report. The clinician must see these warnings before reading
+    the findings content.
     """
     banners = ""
 
     if t1.get("hint_conflict"):
-        note = t1.get("hint_resolution_note") or ""
+        note = html.escape(t1.get("hint_resolution_note") or "")
         banners += f"""
 <div style="background:#1a1a2e; border-left:4px solid #89b4fa; padding:10px 14px;
             border-radius:4px; color:#cdd6f4; font-size:12px; margin-bottom:8px;">
@@ -168,7 +170,7 @@ def build_warning_banners(report: dict, t1: dict) -> str:
         banners += f"""
 <div style="background:#1e1a0a; border-left:4px solid #f9e2af; padding:10px 14px;
             border-radius:4px; color:#f9e2af; font-size:12px; margin-bottom:8px;">
-  <b>[No clinical guideline retrieval]</b> {rag_warning}
+  <b>[No clinical guideline retrieval]</b> {html.escape(rag_warning)}
 </div>
 """
 
@@ -177,24 +179,39 @@ def build_warning_banners(report: dict, t1: dict) -> str:
         banners += f"""
 <div style="background:#1e1a0a; border-left:4px solid #f9e2af; padding:10px 14px;
             border-radius:4px; color:#f9e2af; font-size:12px; margin-bottom:8px;">
-  <b>[Confidence calibration]</b> {calib_note}
+  <b>[Confidence calibration]</b> {html.escape(calib_note)}
 </div>
 """
 
-    # Banner bao dong khi mapper va CoT bat dong
+    # Warning banner when mapper and CoT disagree
     consensus = report.get("consensus")
+    icd10_agreement = report.get("icd10_agreement")
     if consensus is False:
         mapper_r = report.get("mapper_result") or {}
         cot_r    = report.get("cot_result") or {}
         banners += f"""
 <div style="background:#2a1a1a; border-left:4px solid #f38ba8; padding:10px 14px;
             border-radius:4px; color:#f5c2e7; font-size:12px; margin-bottom:8px;">
-  <b>[Bat dong Rule-Engine vs AI Reasoning]</b>
-  Rule engine: severity={mapper_r.get('severity','?')} (level {mapper_r.get('severity_level','?')}),
-  ICD-10={mapper_r.get('icd10_hint','?')}.
-  CoT reasoning: severity={cot_r.get('severity','?')} (level {cot_r.get('severity_level','?')}),
-  ICD-10={cot_r.get('icd10_hint','?')}.
-  <br><b>Can radiologist xac nhan truc tiep do co bat dong giua rule-based va AI reasoning.</b>
+  <b>[Rule-Engine vs AI Reasoning Disagreement]</b>
+  Rule engine: severity={html.escape(str(mapper_r.get('severity','?')))} (level {html.escape(str(mapper_r.get('severity_level','?')))}),
+  ICD-10={html.escape(str(mapper_r.get('icd10_hint','?')))}.
+  CoT reasoning: severity={html.escape(str(cot_r.get('severity','?')))} (level {html.escape(str(cot_r.get('severity_level','?')))}),
+  ICD-10={html.escape(str(cot_r.get('icd10_hint','?')))}.
+  <br><b>Radiologist confirmation required due to disagreement between rule-based and AI reasoning.</b>
+</div>
+"""
+    elif icd10_agreement is False:
+        # Severity agrees but ICD-10 codes differ - this is a separate
+        # disagreement, not folded into the severity banner above.
+        mapper_r = report.get("mapper_result") or {}
+        cot_r    = report.get("cot_result") or {}
+        banners += f"""
+<div style="background:#2a1a1a; border-left:4px solid #f38ba8; padding:10px 14px;
+            border-radius:4px; color:#f5c2e7; font-size:12px; margin-bottom:8px;">
+  <b>[ICD-10 Code Disagreement]</b>
+  Rule engine: ICD-10={html.escape(str(mapper_r.get('icd10_hint','?')))}.
+  CoT reasoning: ICD-10={html.escape(str(cot_r.get('icd10_hint','?')))}.
+  <br><b>Radiologist confirmation required due to ICD-10 code disagreement between rule-based and AI reasoning.</b>
 </div>
 """
 
@@ -203,15 +220,16 @@ def build_warning_banners(report: dict, t1: dict) -> str:
 
 def build_document_report_html(report: dict) -> str:
     """
-    Gop 3 tier thanh 1 bao cao y khoa lien mach theo format radiology chuan:
+    Combine the 3 tiers into one cohesive medical report following the
+    standard radiology format:
     Banners -> Patient/Study Info -> Findings -> Impression -> Citations -> Disclaimer.
     """
     t1  = report.get("tier_1_structured", {})
     t2  = report.get("tier_2_radiological_description", "")
     t3  = report.get("tier_3_diagnostic_suggestion", "")
 
-    severity = t1.get("severity", "unknown")
-    color    = SEVERITY_COLOR.get(severity, "#607D8B")
+    severity = html.escape(t1.get("severity", "unknown"))
+    color    = SEVERITY_COLOR.get(t1.get("severity", "unknown"), "#607D8B")
     level    = t1.get("severity_level", 0)
     dots     = "*" * level + "-" * (4 - level)
 
@@ -231,16 +249,17 @@ def build_document_report_html(report: dict) -> str:
 
   <div style="background:#1e1e2e; color:#cdd6f4; margin-bottom:14px;">
     <span style="color:#a6e3a1; font-weight:bold;">Study Info</span><br>
-    Modality / Organ: <b>{t1.get('modality','?').upper()} / {t1.get('organ','?').upper()}</b>
-    &nbsp; | &nbsp; Image ID: <code style="color:#cba6f7">{report.get('image_id','?')}</code>
+    Modality / Organ: <b>{html.escape(t1.get('modality','?').upper())} / {html.escape(t1.get('organ','?').upper())}</b>
+    &nbsp; | &nbsp; Image ID: <code style="color:#cba6f7">{html.escape(report.get('image_id','?'))}</code>
   </div>
 
   <div style="background:#1e1e2e; color:#cdd6f4; margin-bottom:14px;">
     <span style="color:#a6e3a1; font-weight:bold;">Classification</span><br>
-    <b>{t1.get('label','?').upper()}</b>
+    <b>{html.escape(t1.get('label','?').upper())}</b>
     <span style="color:#585b70"> ({t1.get('confidence',0):.0%} confidence)</span>
-    &nbsp; | &nbsp; {t1.get('risk_category','?')}
-    &nbsp; | &nbsp; ICD-10: <code>{t1.get('icd10_hint','?')}</code>
+    &nbsp; | &nbsp; {html.escape(t1.get('risk_category','?'))}
+    &nbsp; | &nbsp; ICD-10: <code>{html.escape(t1.get('icd10_hint','?'))}</code>
+    {('<span style="color:#f38ba8; font-size:11px;"> (Rule-based / AI reasoning)</span>' if report.get('icd10_agreement') is False else '')}
   </div>
 
   <div style="background:#1e1e2e; color:#cdd6f4; margin-bottom:14px;">
@@ -251,7 +270,7 @@ def build_document_report_html(report: dict) -> str:
 
   <div style="background:#1e1e2e; color:#cdd6f4; margin-bottom:14px;">
     <span style="color:#a6e3a1; font-weight:bold;">Spatial Measurements</span><br>
-    Location: <b>{t1.get('location_quadrant','?')}</b>
+    Location: <b>{html.escape(t1.get('location_quadrant','?'))}</b>
     &nbsp; | &nbsp; Area: <b>{t1.get('area_cm2',0):.3f} cm2</b>
     &nbsp; | &nbsp; Aspect ratio: {t1.get('aspect_ratio',0):.3f}
     {'&nbsp;<span style="color:#f38ba8">[elongated]</span>' if t1.get('aspect_ratio',0) > 1.5 else ''}
@@ -261,12 +280,12 @@ def build_document_report_html(report: dict) -> str:
 
   <div style="margin-bottom:14px; padding:12px; background:#25253a; border-radius:6px;">
     <span style="color:#a6e3a1; font-weight:bold;">Findings</span><br>
-    <span style="color:#cdd6f4">{t2}</span>
+    <span style="color:#cdd6f4">{html.escape(t2)}</span>
   </div>
 
   <div style="margin-bottom:14px; padding:12px; background:#25253a; border-radius:6px;">
     <span style="color:#89b4fa; font-weight:bold;">Impression &amp; Recommendation</span><br>
-    <span style="color:#cdd6f4">{t3}</span>
+    <span style="color:#cdd6f4">{html.escape(t3)}</span>
   </div>
 
   {citations_html}
@@ -282,24 +301,53 @@ def build_document_report_html(report: dict) -> str:
 """
 
 
-# Callback cua Gradio
+# Gradio callbacks
 
 def run_analysis(
     image_pil: Image.Image,
-    question: str,
     hint_display: str,
     progress=gr.Progress(),
 ):
     """
-    Gradio callback khi user nhan Analyze.
+    Gradio callback when the user clicks Analyze.
+
+    No longer takes a question from the UI -- always uses EXAMPLE_QUESTIONS[0]
+    to seed the first RAG retrieve and Tier 2/3. The user's actual question
+    now goes through the Follow-up Questions chatbot after results are in.
 
     Returns:
         annotated_image, document_report_html, raw_json, image_id_state
+
+    Note on Gradio 5+/6+ compatibility:
+        Depending on the Gradio version, the Image component may deliver the
+        uploaded file as a PIL.Image, a filepath string, or a dict like
+        {'path': '/tmp/gradio/...', 'url': '...'}. We normalise all three
+        shapes here so the rest of the function always works with a PIL image.
     """
+    # --- Normalise Gradio image input shapes ---
     if image_pil is None:
-        raise gr.Error("Vui long upload anh truoc.")
-    if not question.strip():
-        question = EXAMPLE_QUESTIONS[0]
+        raise gr.Error("Please upload an image first.")
+
+    if isinstance(image_pil, dict):
+        # Gradio 5+/6+ may pass a dict when the temp file lifecycle races with
+        # the preprocess step. Extract the path and open it ourselves.
+        path = image_pil.get("path") or image_pil.get("name")
+        if not path or not os.path.exists(path):
+            raise gr.Error(
+                "The uploaded image could not be read (temp file missing). "
+                "Please re-upload the image and try again."
+            )
+        image_pil = Image.open(path).copy()  # .copy() detaches from the file handle
+
+    elif isinstance(image_pil, str):
+        # Gradio type="filepath" passes a string path
+        if not os.path.exists(image_pil):
+            raise gr.Error(
+                f"Image file not found: {image_pil}. Please re-upload and try again."
+            )
+        image_pil = Image.open(image_pil).copy()
+    # --- End normalisation ---
+    question = EXAMPLE_QUESTIONS[0]
 
     organ_hint = HINT_OPTIONS.get(hint_display or "Auto-detect")
 
@@ -311,7 +359,7 @@ def run_analysis(
         raise
     except Exception as e:
         raise gr.Error(
-            f"Connection error: {e}\nKiem tra orchestrator dang chay tai {ORCHESTRATOR_URL}"
+            f"Connection error: {e}\nCheck that the orchestrator is running at {ORCHESTRATOR_URL}"
         )
 
     progress(0.8, desc="Rendering report...")
@@ -336,17 +384,18 @@ def send_chat(
     image_id: str,
 ):
     """
-    Gradio callback cho chatbot - goi /chat khong gui lai anh.
+    Gradio callback for the chatbot - calls /chat without resending the image.
 
     chat_history: list[dict] {"role": "user"|"assistant", "content": str}.
-    Phai sanitize truoc khi gui sang orchestrator (Gradio co the them key la).
+    Must be sanitized before sending to the orchestrator (Gradio may add a
+    stray key).
     """
     if not image_id:
-        raise gr.Error("Chua co anh duoc phan tich. Vui long Analyze truoc.")
+        raise gr.Error("No image has been analyzed yet. Please run Analyze first.")
     if not message.strip():
         return chat_history, ""
 
-    # Chi giu role + content str, bo qua entry khong hop le
+    # Keep only role + content str, skip invalid entries
     history_dicts = []
     for turn in chat_history:
         role = turn.get("role")
@@ -369,9 +418,9 @@ def send_chat(
     return chat_history, ""
 
 
-# Xay dung layout UI
+# Build UI layout
 
-# Ep dark mode, khong phu thuoc setting OS
+# Force dark mode, independent of OS setting
 _FORCE_DARK_JS = """
 () => {
     document.documentElement.setAttribute('data-theme', 'dark');
@@ -424,7 +473,7 @@ def build_ui() -> gr.Blocks:
         title="Med-Platform -- AI Medical Imaging Assistant",
     ) as demo:
 
-        # Luu image_id de chatbot biet phan tich nao dang duoc hoi
+        # Store image_id so the chatbot knows which analysis is being asked about
         image_id_state = gr.State("")
 
         gr.HTML("""
@@ -438,7 +487,7 @@ def build_ui() -> gr.Blocks:
 
         with gr.Row():
 
-            # Cot trai: input va anh annotated
+            # Left column: input and annotated image
             with gr.Column(scale=1):
 
                 image_input = gr.Image(
@@ -451,17 +500,6 @@ def build_ui() -> gr.Blocks:
                     choices=list(HINT_OPTIONS.keys()),
                     value="Auto-detect",
                     label="Modality / Organ hint",
-                )
-                question_input = gr.Textbox(
-                    label="Clinical Question",
-                    placeholder=EXAMPLE_QUESTIONS[0],
-                    lines=2,
-                )
-                gr.Examples(
-                    examples=[[q] for q in EXAMPLE_QUESTIONS],
-                    inputs=[question_input],
-                    label="Example questions",
-                    examples_per_page=5,
                 )
                 analyze_btn = gr.Button("Analyze", variant="primary", size="lg")
                 gr.HTML("""
@@ -477,7 +515,7 @@ def build_ui() -> gr.Blocks:
                     interactive=False,
                 )
 
-            # Cot phai: bao cao va chatbot
+            # Right column: report and chatbot
             with gr.Column(scale=2):
 
                 with gr.Tabs():
@@ -503,7 +541,7 @@ def build_ui() -> gr.Blocks:
                   Follow-up Questions
                 </div>
                 <div style="color:#585b70; font-size:11px; margin-bottom:8px; background:#1e1e2e;">
-                  Hoi them ve ket qua da phan tich -- khong can upload lai anh.
+                  Ask follow-up questions about the analyzed results -- no need to re-upload the image.
                 </div>
                 """)
                 chatbot = gr.Chatbot(
@@ -513,7 +551,7 @@ def build_ui() -> gr.Blocks:
                 )
                 with gr.Row():
                     chat_input = gr.Textbox(
-                        placeholder="Hoi them ve ket qua nay...",
+                        placeholder=f"e.g. \"{EXAMPLE_QUESTIONS[1]}\"",
                         label="",
                         lines=1,
                         scale=5,
@@ -521,17 +559,12 @@ def build_ui() -> gr.Blocks:
                     )
                     chat_btn = gr.Button("Send", scale=1, size="sm")
 
-        # Ket noi events voi callback
+        # Wire up events to callbacks
         analyze_btn.click(
             fn=run_analysis,
-            inputs=[image_input, question_input, modality_hint_dropdown],
+            inputs=[image_input, modality_hint_dropdown],
             outputs=[annotated_output, document_report_output, raw_output, image_id_state],
             api_name="analyze",
-        )
-        question_input.submit(
-            fn=run_analysis,
-            inputs=[image_input, question_input, modality_hint_dropdown],
-            outputs=[annotated_output, document_report_output, raw_output, image_id_state],
         )
 
         chat_btn.click(

@@ -28,14 +28,16 @@ Response:
         "bottleneck_features": {...}
     }
 
-bottleneck_features duoc nhan tu orchestrator va truyen thang qua response
-(pass-through). Knowledge service KHONG xu ly field nay -- chi bao ton
-de orchestrator dua vao prompt LLM ma khong can goi lai vision.
+bottleneck_features is received from the orchestrator and forwarded straight
+through the response (pass-through). The knowledge service does NOT process
+this field -- it only preserves it so the orchestrator can use it in the
+LLM prompt without calling vision again.
 """
 
 import os
 import sys
 import time
+import logging
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
@@ -48,24 +50,26 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 from shared.schemas import KnowledgeMapped, SpatialDerived
 from services.knowledge.mapper import map_knowledge, derive_spatial
 
+logger = logging.getLogger(__name__)
+
 try:
     from prometheus_client import Counter, Histogram, generate_latest, CONTENT_TYPE_LATEST
     PROM_AVAILABLE = True
     _map_latency = Histogram(
         "knowledge_map_duration_seconds",
-        "Latency cua /map endpoint",
+        "Latency of the /map endpoint",
         buckets=[0.01, 0.05, 0.1, 0.25, 0.5, 1.0],
     )
     _map_counter = Counter(
         "knowledge_map_requests_total",
-        "Tong so request /map",
+        "Total number of /map requests",
         ["organ", "label", "status"],
     )
 except ImportError:
     PROM_AVAILABLE = False
 
 
-# Model cho request va response
+# Request and response models
 
 class MapRequest(BaseModel):
     modality:            str   = Field(..., example="ultrasound")
@@ -78,7 +82,7 @@ class MapRequest(BaseModel):
     pixel_spacing_mm:    float = Field(default=0.1)
     bottleneck_features: Optional[dict] = Field(
         default=None,
-        description="Pass-through tu vision -- khong xu ly, chi truyen lai trong response",
+        description="Pass-through from vision -- not processed, just forwarded in the response",
     )
 
 
@@ -87,7 +91,7 @@ class MapResponse(BaseModel):
     spatial_derived:     SpatialDerived
     bottleneck_features: dict = Field(
         default_factory=dict,
-        description="Pass-through tu vision -- orchestrator doc lai de dua vao LLM prompt",
+        description="Pass-through from vision -- the orchestrator reads it to use in the LLM prompt",
     )
 
 
@@ -107,35 +111,35 @@ def health():
 def metrics():
     """Prometheus metrics endpoint."""
     if not PROM_AVAILABLE:
-        return PlainTextResponse("# prometheus_client chua install\n", status_code=200)
+        return PlainTextResponse("# prometheus_client not installed\n", status_code=200)
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/map", response_model=MapResponse)
 def map_endpoint(req: MapRequest):
     """
-    Nhan ModelOutput fields -> tra ve KnowledgeMapped + SpatialDerived.
+    Takes ModelOutput fields -> returns KnowledgeMapped + SpatialDerived.
 
-    Khong stateful - moi request doc lap, khong can model load.
-    Rule-based: audit duoc boi clinician ma khong can doc code phuc tap.
-    bottleneck_features duoc nhan nhung khong xu ly -- chi truyen xuyen qua.
+    Not stateful - each request is independent, no model loading needed.
+    Rule-based: auditable by a clinician without needing to read complex code.
+    bottleneck_features is received but not processed -- just passed through.
     """
     valid_labels = {"benign", "malignant", "normal"}
     if req.top_label.lower() not in valid_labels:
         raise HTTPException(
             status_code=400,
-            detail=f"top_label phai la mot trong: {valid_labels}. Nhan: '{req.top_label}'",
+            detail=f"top_label must be one of: {valid_labels}. Received: '{req.top_label}'",
         )
 
     valid_organs = {"breast", "thyroid"}
     if req.organ.lower() not in valid_organs:
         raise HTTPException(
             status_code=400,
-            detail=f"organ phai la mot trong: {valid_organs}. Nhan: '{req.organ}'",
+            detail=f"organ must be one of: {valid_organs}. Received: '{req.organ}'",
         )
 
     if len(req.original_size) != 2:
-        raise HTTPException(status_code=400, detail="original_size phai la [H, W].")
+        raise HTTPException(status_code=400, detail="original_size must be [H, W].")
 
     t_start = time.perf_counter()
     try:
@@ -167,7 +171,8 @@ def map_endpoint(req: MapRequest):
             _map_counter.labels(
                 organ=req.organ, label=req.top_label, status="error"
             ).inc()
-        raise HTTPException(status_code=500, detail=f"Mapping error: {str(e)}")
+        logger.exception("Mapping failed")
+        raise HTTPException(status_code=500, detail="Internal error during mapping. Check server logs.")
     finally:
         if PROM_AVAILABLE:
             _map_latency.observe(time.perf_counter() - t_start)

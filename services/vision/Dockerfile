@@ -2,7 +2,7 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# System deps cho OpenCV
+# System deps for OpenCV
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libgl1 \
     libglib2.0-0 \
@@ -11,16 +11,20 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxrender-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements trước để tận dụng Docker layer cache
+# Copy requirements first to take advantage of Docker layer caching
 COPY requirements/vision.txt requirements.txt
-# Cài torch bản CPU-only (nhẹ hơn nhiều so với bản CUDA mặc định từ PyPI,
-# tránh lỗi tải hỏng/đứt giữa đường do file quá lớn)
+# Install the CPU-only torch build (much lighter than the default CUDA
+# build from PyPI, avoids broken/interrupted downloads from oversized files)
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy shared schemas và service code
+# Copy shared schemas and service code
 COPY shared/ ./shared/
 COPY services/vision/ ./services/vision/
+
+RUN useradd --create-home --shell /bin/bash appuser \
+    && chown -R appuser:appuser /app
+USER appuser
 
 EXPOSE 8002
 

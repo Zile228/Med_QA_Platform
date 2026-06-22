@@ -1,21 +1,22 @@
 """
 scripts/check_drift.py
 ========================
-Script kiem tra data drift thu cong -- KHONG phai service chay lien tuc.
-Chay thu cong khi can, output ra HTML + JSON de doc thu cong.
+Manual data drift check script -- NOT a continuously running service.
+Run manually as needed, outputs HTML + JSON for manual review.
 
-Muc tieu:
-    Phat hien som neu phan phoi anh test moi lech so voi du lieu train (BUSI/TN3K),
-    hoac phan phoi confidence score bat thuong (>= 0.999 dai tro overfitting).
+Goal:
+    Detect early if a new batch of test images diverges from the training
+    data distribution (BUSI/TN3K), or if confidence score distribution is
+    abnormal (>= 0.999 hints at overfitting).
 
-Tool su dung: Deepchecks (uu tien) hoac Evidently (fallback).
+Tools used: Deepchecks (preferred) or Evidently (fallback).
 
 Input:
-    --ref_dir     : Thu muc anh tham chieu (tap validate BUSI/TN3K).
-    --cur_dir     : Thu muc anh moi can kiem tra.
-    --scores_json : JSON list cac confidence score tu lan phan tich gan nhat.
-                    Dinh dang: [{"image_id": "...", "confidence": 0.87, "label": "benign"}, ...]
-    --out_dir     : Thu muc output (default: reports/drift/).
+    --ref_dir     : Reference image directory (BUSI/TN3K validation set).
+    --cur_dir     : New image directory to check.
+    --scores_json : JSON list of confidence scores from the most recent analysis run.
+                    Format: [{"image_id": "...", "confidence": 0.87, "label": "benign"}, ...]
+    --out_dir     : Output directory (default: reports/drift/).
 
 Usage:
     python scripts/check_drift.py \\
@@ -34,25 +35,25 @@ from pathlib import Path
 
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Kiem tra data drift (Deepchecks / Evidently).")
+    p = argparse.ArgumentParser(description="Check data drift (Deepchecks / Evidently).")
     p.add_argument("--ref_dir",     default="data/busi_val",
-                   help="Thu muc anh tham chieu (tap validate)")
+                   help="Reference image directory (validation set)")
     p.add_argument("--cur_dir",     default="data/incoming",
-                   help="Thu muc anh moi can kiem tra")
+                   help="New image directory to check")
     p.add_argument("--scores_json", default=None,
-                   help="File JSON chua confidence scores gan nhat")
+                   help="JSON file containing the most recent confidence scores")
     p.add_argument("--out_dir",     default="reports/drift",
-                   help="Thu muc output cho report")
+                   help="Output directory for the report")
     p.add_argument("--backend",     choices=["deepchecks", "evidently", "auto"],
                    default="auto",
-                   help="Tool su dung. 'auto' thu deepchecks truoc, fallback evidently")
+                   help="Tool to use. 'auto' tries deepchecks first, falls back to evidently")
     return p.parse_args()
 
 
 def _load_images_as_array(directory: str):
     """
-    Load anh tu thu muc -> numpy array [N, H, W, C] sau khi resize ve 256x256.
-    Tra ve array rong neu khong tim thay anh.
+    Loads images from a directory -> numpy array [N, H, W, C] after resizing to 256x256.
+    Returns an empty array if no images are found.
     """
     import numpy as np
     try:
@@ -78,11 +79,11 @@ def _load_images_as_array(directory: str):
 
 def _extract_image_features(images_array) -> dict:
     """
-    Tinh cac features de kiem tra drift:
-        - do sang trung binh (mean brightness)
-        - do tuong phan (std brightness)
-        - ty le aspect ratio (256x256 nen luon = 1, nhung dung de mo rong sau)
-        - phan phoi kich thuoc file (byte) -- dau hieu ve compression artifact
+    Computes features for drift checking:
+        - mean brightness
+        - contrast (brightness std)
+        - aspect ratio (256x256 so always = 1, but kept for future extension)
+        - file size distribution (bytes) -- a sign of compression artifacts
     """
     import numpy as np
 
@@ -103,15 +104,15 @@ def _extract_image_features(images_array) -> dict:
 
 def _check_confidence_anomaly(scores: list) -> dict:
     """
-    Phat hien dau hieu overfitting / distribution shift qua confidence score:
-        - ty le request co confidence >= 0.999 (dat nguong canh bao)
-        - phan phoi tong the: mean, std, min, max
-        - ty le theo label: co label nao bi "collapse" ve 1 class khong
+    Detects signs of overfitting / distribution shift via confidence scores:
+        - rate of requests with confidence >= 0.999 (warning threshold)
+        - overall distribution: mean, std, min, max
+        - rate by label: has any label "collapsed" onto a single class
 
-    Tra ve dict ket qua + flag is_anomalous.
+    Returns a result dict + the is_anomalous flag.
     """
     if not scores:
-        return {"is_anomalous": False, "reason": "Khong co score de kiem tra."}
+        return {"is_anomalous": False, "reason": "No scores to check."}
 
     import numpy as np
 
@@ -131,15 +132,15 @@ def _check_confidence_anomaly(scores: list) -> dict:
     if high_conf_rate >= 0.3:
         is_anomalous = True
         reasons.append(
-            f"{high_conf_rate:.0%} request co confidence >= 0.999 "
-            f"-- dau hieu overfitting hoac distribution khac tap train."
+            f"{high_conf_rate:.0%} of requests have confidence >= 0.999 "
+            f"-- a sign of overfitting or a distribution different from the training set."
         )
 
     if dominant_rate >= 0.9 and len(label_counts) > 1:
         is_anomalous = True
         reasons.append(
-            f"Label '{dominant_label}' chiem {dominant_rate:.0%} tong request "
-            f"-- co the model bi collapse ve 1 class."
+            f"Label '{dominant_label}' accounts for {dominant_rate:.0%} of all requests "
+            f"-- the model may have collapsed onto a single class."
         )
 
     return {
@@ -157,11 +158,11 @@ def _check_confidence_anomaly(scores: list) -> dict:
 
 def _per_image_brightness_contrast(images_array) -> "tuple":
     """
-    Tinh brightness/contrast cho TUNG anh (khong gop thanh 1 so trung binh).
-    Can thiet cho drift detection vi cac tool drift can phan phoi nhieu mau,
-    khong phai 1 gia tri summary duy nhat.
+    Computes brightness/contrast for EACH image (not collapsed into one mean value).
+    Necessary for drift detection since drift tools need a distribution of many
+    samples, not a single summary value.
 
-    Tra ve (list[float] brightness, list[float] contrast).
+    Returns (list[float] brightness, list[float] contrast).
     """
     if images_array.shape[0] == 0:
         return [], []
@@ -172,25 +173,26 @@ def _per_image_brightness_contrast(images_array) -> "tuple":
 
 def _run_deepchecks(ref_images, cur_images, out_dir: str) -> str:
     """
-    Chay Deepchecks ImagePropertyDrift, tra ve path report HTML.
+    Runs Deepchecks ImagePropertyDrift, returns the path to the HTML report.
 
-    Dung VisionData voi batch_loader generator tra ve BatchOutputFormat -- cach build
-    VisionData tu raw numpy array ma khong can model/labels (ImagePropertyDrift chi
-    can anh). API deepchecks.vision co the thay doi giua cac phien ban; neu loi import
-    hoac loi runtime, kiem tra lai doc deepchecks tuong ung voi version dang cai.
+    Uses VisionData with a batch_loader generator returning BatchOutputFormat --
+    the way to build VisionData from a raw numpy array without needing
+    model/labels (ImagePropertyDrift only needs images). The deepchecks.vision
+    API can change between versions; on import or runtime errors, check the
+    deepchecks docs matching the installed version.
     """
     try:
         from deepchecks.vision.checks import ImagePropertyDrift
         from deepchecks.vision.vision_data import VisionData
         from deepchecks.vision.vision_data.batch_wrapper import BatchOutputFormat
     except ImportError:
-        raise ImportError("deepchecks chua install: pip install deepchecks[vision]")
+        raise ImportError("deepchecks is not installed: pip install deepchecks[vision]")
 
     if ref_images.shape[0] == 0 or cur_images.shape[0] == 0:
-        raise ValueError("Can it nhat 1 anh trong moi tap de kiem tra drift.")
+        raise ValueError("Need at least 1 image in each set to check for drift.")
 
     def _make_loader(images_array, batch_size=16):
-        """Generator tra ve BatchOutputFormat tung batch anh -- khong can labels/predictions."""
+        """Generator returning BatchOutputFormat per image batch -- no labels/predictions needed."""
         n = images_array.shape[0]
         for start in range(0, n, batch_size):
             batch = images_array[start:start + batch_size]
@@ -217,23 +219,24 @@ def _run_deepchecks(ref_images, cur_images, out_dir: str) -> str:
 
 def _run_evidently(ref_images, cur_images, out_dir: str) -> str:
     """
-    Chay Evidently DataDriftPreset tren phan phoi brightness/contrast THEO TUNG ANH.
+    Runs Evidently DataDriftPreset on the PER-IMAGE brightness/contrast distribution.
 
-    Khong dung 1-row summary (mean cua mean khong the hien duoc drift ve phan phoi) -
-    moi anh la 1 dong trong DataFrame de Evidently tinh duoc KS-test / PSI dung cach.
+    Does not use a 1-row summary (mean of means cannot reveal distributional
+    drift) - each image is one row in the DataFrame so Evidently can compute
+    KS-test / PSI correctly.
     """
     try:
         import pandas as pd
         from evidently.report import Report
         from evidently.metric_preset import DataDriftPreset
     except ImportError:
-        raise ImportError("evidently chua install: pip install evidently pandas")
+        raise ImportError("evidently is not installed: pip install evidently pandas")
 
     ref_bright, ref_contrast = _per_image_brightness_contrast(ref_images)
     cur_bright, cur_contrast = _per_image_brightness_contrast(cur_images)
 
     if not ref_bright or not cur_bright:
-        raise ValueError("Can it nhat 1 anh trong moi tap de kiem tra drift.")
+        raise ValueError("Need at least 1 image in each set to check for drift.")
 
     ref_df = pd.DataFrame({"brightness": ref_bright, "contrast": ref_contrast})
     cur_df = pd.DataFrame({"brightness": cur_bright, "contrast": cur_contrast})
@@ -250,10 +253,10 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    print("[check_drift] Dang chay kiem tra data drift...")
-    print(f"  Tap tham chieu : {args.ref_dir}")
-    print(f"  Tap can kiem   : {args.cur_dir}")
-    print(f"  Output         : {args.out_dir}")
+    print("[check_drift] Running data drift check...")
+    print(f"  Reference set : {args.ref_dir}")
+    print(f"  Set to check  : {args.cur_dir}")
+    print(f"  Output        : {args.out_dir}")
 
     report = {
         "generated_at": datetime.now().isoformat(),
@@ -262,11 +265,11 @@ def main():
         "scores_json":   args.scores_json,
     }
 
-    print("\n[check_drift] Load anh...")
+    print("\n[check_drift] Loading images...")
     ref_images, ref_paths = _load_images_as_array(args.ref_dir)
     cur_images, cur_paths = _load_images_as_array(args.cur_dir)
-    print(f"  Tap tham chieu: {len(ref_paths)} anh")
-    print(f"  Tap can kiem:   {len(cur_paths)} anh")
+    print(f"  Reference set: {len(ref_paths)} images")
+    print(f"  Set to check:  {len(cur_paths)} images")
 
     ref_features = _extract_image_features(ref_images)
     cur_features = _extract_image_features(cur_images)
@@ -286,37 +289,37 @@ def main():
         }
         if brightness_diff > 30:
             print(
-                f"  [CANH BAO] Do sang lech nhieu: "
+                f"  [WARNING] Large brightness difference: "
                 f"ref={ref_features['brightness_mean']:.1f}, "
                 f"cur={cur_features['brightness_mean']:.1f}"
             )
         if contrast_diff > 20:
             print(
-                f"  [CANH BAO] Do tuong phan lech nhieu: "
+                f"  [WARNING] Large contrast difference: "
                 f"ref={ref_features['contrast_mean']:.1f}, "
                 f"cur={cur_features['contrast_mean']:.1f}"
             )
 
     scores = []
     if args.scores_json and os.path.exists(args.scores_json):
-        print(f"\n[check_drift] Kiem tra confidence scores: {args.scores_json}")
+        print(f"\n[check_drift] Checking confidence scores: {args.scores_json}")
         with open(args.scores_json) as f:
             scores = json.load(f)
         conf_check = _check_confidence_anomaly(scores)
         report["confidence_check"] = conf_check
         if conf_check["is_anomalous"]:
-            print("  [CANH BAO] Phat hien bat thuong trong confidence scores:")
+            print("  [WARNING] Anomaly detected in confidence scores:")
             for reason in conf_check["reasons"]:
                 print(f"    - {reason}")
         else:
             print(f"  Confidence OK: mean={conf_check['conf_mean']:.3f}, "
                   f"high_conf_rate={conf_check['high_conf_rate']:.1%}")
     else:
-        print("\n[check_drift] Bo qua kiem tra confidence (--scores_json khong co).")
+        print("\n[check_drift] Skipping confidence check (--scores_json not provided).")
 
     html_path = None
     if len(ref_paths) > 0 and len(cur_paths) > 0:
-        print(f"\n[check_drift] Chay drift detection (backend={args.backend})...")
+        print(f"\n[check_drift] Running drift detection (backend={args.backend})...")
 
         backends = (
             ["deepchecks", "evidently"] if args.backend == "auto"
@@ -328,32 +331,32 @@ def main():
                     html_path = _run_deepchecks(ref_images, cur_images, args.out_dir)
                 else:
                     html_path = _run_evidently(ref_images, cur_images, args.out_dir)
-                print(f"  Backend su dung: {backend}")
+                print(f"  Backend used: {backend}")
                 report["drift_backend"] = backend
                 report["drift_html"]    = html_path
                 break
             except ImportError as e:
-                print(f"  {backend} khong co: {e}")
+                print(f"  {backend} not available: {e}")
             except Exception as e:
-                print(f"  {backend} loi: {e}")
+                print(f"  {backend} error: {e}")
     else:
-        print("\n[check_drift] Khong du anh de chay drift detection. Chi kiem tra confidence.")
+        print("\n[check_drift] Not enough images to run drift detection. Confidence check only.")
 
     json_path = os.path.join(args.out_dir, "drift_report.json")
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
-    print(f"\n[check_drift] Ket qua:")
+    print(f"\n[check_drift] Results:")
     print(f"  JSON report: {json_path}")
     if html_path:
         print(f"  HTML report: {html_path}")
 
     conf_check = report.get("confidence_check", {})
     if conf_check.get("is_anomalous"):
-        print("\n[check_drift] KET LUAN: Phat hien bat thuong. Doc report de xem chi tiet.")
+        print("\n[check_drift] CONCLUSION: Anomaly detected. Read the report for details.")
         sys.exit(1)
     else:
-        print("\n[check_drift] KET LUAN: Khong phat hien bat thuong ro ret.")
+        print("\n[check_drift] CONCLUSION: No clear anomaly detected.")
         sys.exit(0)
 
 
