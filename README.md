@@ -102,7 +102,11 @@ A microservice platform that takes a breast or thyroid ultrasound image and retu
 - **Degraded mode:** if no checkpoint file exists, the service still starts (useful for local dev) but every response is tagged `router_degraded=True`; the orchestrator refuses to act on a degraded routing decision unless `ALLOW_DEGRADED_ROUTER=true`.
 
 ### Layer 2 - Vision (`services/vision`)
-- **Architecture:** `UNet_MTL`, an EfficientNet-B4 encoder shared between two heads: a U-Net-style decoder for **segmentation** (sigmoid mask) and a small FC head off the bottleneck for **classification** (`benign` / `malignant` / `normal`).
+- **Architecture:** `UNet_MTL`, an EfficientNet-B4 encoder shared between two heads: a U-Net-style decoder for **segmentation** (sigmoid mask) and a small FC head off the bottleneck for **classification**.
+<p align="center">
+  <img src="images/MTL architecture.png" width="600">
+</p>
+
 - **Two near-identical modules**, one per organ, differing only in `NUM_CLASSES` (3 for breast/BUSI, 2 for thyroid/TN3K), normalization stats, and class mapping:
   - `services/vision/us_breast` - trained on the **BUSI** dataset.
   - `services/vision/us_thyroid` - trained on the **TN3K** dataset.
