@@ -3,31 +3,14 @@ services/orchestrator/graph.py
 ================================
 LangGraph pipeline - orchestrates the entire flow.
 
-Graph (fan-out/fan-in after adding CoT):
-    route -> vision -> knowledge  --|
-          -> cot_reasoning        --|-> merge -> consistency_guard -> qa_agent
-          -> rag_retrieve         --|
-
-    The three branches after route run in parallel (knowledge + cot_reasoning + rag).
-    merge waits for ALL THREE branches before running consistency_guard.
-    consistency_guard compares severity_level (consensus) and icd10_hint (icd10_agreement)
-    of mapper vs CoT, two separate flags since they are two different clinical questions.
-
-Each node = 1 HTTP call to the corresponding service:
-    route_node            -> POST router:8001/route
-    vision_node           -> POST vision:8002/analyze/{modality}
-    knowledge_node        -> POST knowledge:8003/map
-    cot_reasoning_node    -> LLM Chain-of-Thought (runs in parallel with knowledge)
-    rag_node              -> FAISS retrieve (local, no HTTP)
-    merge_node            -> checks state, short-circuits on error
-    consistency_guard_node -> compares mapper vs CoT, sets consensus flag
-    qa_agent_node         -> LLM generates the 3-tier report
+Graph topology:
+    route -> vision -> spatial -> knowledge                      --|
+                               -> rag_retrieve -> cot_reasoning  --|-> merge -> consistency_guard -> qa_agent
 
 Public API:
     build_graph(services_cfg, llm_client, rag_store, registry) -> CompiledGraph
-    run_pipeline(graph, image_bytes, question, image_id,
-                 modality_hint, organ_hint) -> ReportOutput dict
-    run_pipeline_async(...) -> ReportOutput dict  (for FastAPI async handler)
+    run_pipeline(graph, image_bytes, image_id, modality_hint, organ_hint) -> ReportOutput dict
+    run_pipeline_async(...) -> ReportOutput dict
 """
 
 import asyncio
@@ -50,9 +33,8 @@ from shared.schemas import (
     RagSource, CoTResult,
 )
 from shared.telemetry import get_tracer
+from services.orchestrator.visual_interpreter import interpret_visual_features
 
-
-# Reducers for LangGraph state
 
 def _keep_last(a, b):
     """Reducer: keep the newest non-None value."""
@@ -65,42 +47,35 @@ def _merge_list(a, b):
 
 
 class OrchestratorState(TypedDict):
-    # Input - unchanged after init
     image_bytes:    bytes
-    question:       str
     image_id:       str
     modality_hint:  Optional[str]
     organ_hint:     Optional[str]
+    pixel_spacing_mm: Optional[float]
+    laterality:     Optional[str]
 
-    # Layer 1 output
     routing:        Annotated[Optional[dict], _keep_last]
-
-    # Layer 2 output
     model_output:   Annotated[Optional[dict], _keep_last]
 
-    # Layer 3 output from the rule-based mapper
     knowledge:      Annotated[Optional[dict], _keep_last]
     spatial:        Annotated[Optional[dict], _keep_last]
 
-    # Layer 3 output from the CoT engine (runs in parallel with knowledge)
     cot_result:     Annotated[Optional[dict], _keep_last]
 
-    # RAG context from the branch running in parallel with vision
     rag_chunks:     Annotated[list, _merge_list]
     rag_meta:       Annotated[list, _merge_list]
 
-    # Result of comparing mapper vs CoT
     consensus:      Annotated[Optional[bool], _keep_last]
     icd10_agreement: Annotated[Optional[bool], _keep_last]
+    label_agreement: Annotated[Optional[bool], _keep_last]
+    hard_conflict:  Annotated[Optional[bool], _keep_last]
 
-    # Final output
+    visual_flags:   Annotated[list, _merge_list]
+    risk_modifier:  Annotated[Optional[int], _keep_last]
+
     report:         Annotated[Optional[dict], _keep_last]
-
-    # Error tracking
     error:          Annotated[Optional[str], _keep_last]
 
-
-# HTTP call helpers
 
 def _post_json(url: str, json_body: dict, timeout: int = 60) -> dict:
     with httpx.Client(timeout=timeout) as client:
@@ -129,7 +104,6 @@ async def _post_multipart_async(
     fields: dict = None,
     timeout: int = 120,
 ) -> dict:
-    """Async version of _post_multipart - used by async nodes."""
     files = {"image": ("image.png", image_bytes, "image/png")}
     data = fields or {}
     async with httpx.AsyncClient(timeout=timeout) as client:
@@ -149,8 +123,6 @@ async def _post_json_async(
         return resp.json()
 
 
-# Building prompts for the LLM
-
 SYSTEM_PROMPT = """You are an AI radiology assistant helping generate structured clinical reports.
 You receive structured image analysis data and must produce clear, professional radiological descriptions.
 Always include the disclaimer that findings must be confirmed by a qualified radiologist.
@@ -167,37 +139,17 @@ Reason step by step, showing your work explicitly.
 Your output MUST be valid JSON matching the schema provided. Output ONLY the JSON object, no preamble."""
 
 
-def _format_bottleneck(bottleneck: dict) -> str:
-    """Format bottleneck_features into descriptive text for the prompt."""
-    if not bottleneck:
-        return "Bottleneck features: no data available."
-
-    energy = bottleneck.get("activation_energy", "N/A")
-    hotspot = bottleneck.get("attention_hotspot_grid", [])
-    top_ch = bottleneck.get("top_channel_activations", [])
-
-    # hotspot is a single [row, col] coordinate pair (where the model focuses most),
-    # NOT a 2D matrix -- see services/vision/us_breast/model.py: hotspot_pos = [row, col]
-    hotspot_str = ""
-    if hotspot and len(hotspot) == 2:
-        hotspot_str = f"region [{hotspot[0]},{hotspot[1]}] (7x7 grid)"
-
-    return (
-        f"Bottleneck activation energy: {energy}. "
-        f"Strongest attention focus: {hotspot_str or 'undetermined'}. "
-        f"Top channels: {top_ch[:3] if top_ch else 'N/A'}."
-    )
-
-
 def _build_report_prompt(
     unified: dict,
-    question: str,
     rag_chunks: list,
     cot_result: Optional[dict] = None,
     consensus: Optional[bool] = None,
     icd10_agreement: Optional[bool] = None,
+    visual_flags: list = None,
+    risk_modifier: int = 0,
+    hard_conflict: Optional[bool] = None,
 ) -> str:
-    """Build the LLM prompt from UnifiedOutput + user question + RAG context + CoT."""
+    """Build the LLM prompt from UnifiedOutput + RAG context + CoT."""
     rag_context = (
         "\n\n".join(rag_chunks) if rag_chunks
         else "No additional clinical guidelines retrieved."
@@ -205,10 +157,28 @@ def _build_report_prompt(
     km = unified.get("knowledge_mapped", {})
     sd = unified.get("spatial_derived", {})
     mo = unified.get("model_output", {})
-    bottleneck_text = _format_bottleneck(mo.get("bottleneck_features", {}))
+
+    area_val = sd.get("area_cm2")
+    area_str = f"{area_val:.3f} cm2" if area_val is not None else "unavailable (no DICOM metadata)"
+
+    hard_conflict_block = ""
+    if hard_conflict is True:
+        cnn_label = mo.get("top_label", "unknown")
+        cot_label = (cot_result or {}).get("cot_label", "unknown")
+        cot_sev = (cot_result or {}).get("severity", "unknown")
+        mapper_sev = km.get("severity", "unknown")
+        hard_conflict_block = f"""
+### HARD CONFLICT -- Radiologist Review Mandatory
+The CNN model classified this as: {cnn_label}
+Independent CoT reasoning classified this as: {cot_label}
+Rule engine severity: {mapper_sev} | CoT severity: {cot_sev}
+
+IMPORTANT: Do NOT pick a side. Present BOTH interpretations in Tier 3.
+State explicitly: "Mandatory radiologist review required -- AI assessments are in conflict."
+"""
 
     consensus_block = ""
-    if cot_result is not None:
+    if cot_result is not None and hard_conflict is not True:
         if consensus is False:
             cot_sev = cot_result.get("severity", "unknown")
             cot_icd = cot_result.get("icd10_hint", "unknown")
@@ -232,9 +202,6 @@ IMPORTANT: In Tier 3, CLEARLY present BOTH perspectives and state:
 CoT audit trail: {cot_reason}
 """
 
-    # icd10_agreement is a question separate from consensus -- severity can
-    # agree while the ICD-10 codes still differ, requiring an independent
-    # warning to the LLM.
     icd10_block = ""
     if icd10_agreement is False and consensus is not False:
         mapper_icd = km.get("icd10_hint", "unknown")
@@ -246,11 +213,20 @@ Severity agrees but the ICD-10 codes differ -- this is an independent clinical
 disagreement, you MUST state BOTH codes in Tier 2 and Tier 3.
 """
 
+    # Visual flags now contain only spatial-derived flags (aspect ratio,
+    # circularity). Uncertainty and Grad-CAM overlap flags are disabled
+    # pending more grounded proxy metrics.
+    flags_text = "\n".join(f"  - {f}" for f in (visual_flags or []))
+    visual_flags_block = ""
+    if visual_flags:
+        visual_flags_block = f"""
+### Visual Feature Flags (spatial features only)
+{flags_text}
+Cumulative risk modifier: {risk_modifier:+d}
+"""
+
     prompt = f"""
 ## Clinical Image Analysis -- Structured Report Generation
-
-### User Question
-{question}
 
 ### Image Analysis Results
 - Modality: {unified.get('modality', 'unknown')} | Organ: {unified.get('organ', 'unknown')}
@@ -262,18 +238,14 @@ disagreement, you MUST state BOTH codes in Tier 2 and Tier 3.
 
 ### Spatial Features (from segmentation mask)
 - Location: {sd.get('location_quadrant', 'unknown')}
-- Area: {sd.get('area_cm2', 0)} cm2
-- Aspect ratio: {sd.get('aspect_ratio', 0)} (>1.5 = elongated / suspicious)
+- Area: {area_str}
+- Aspect ratio: {sd.get('aspect_ratio', 0):.3f} -- {sd.get('aspect_ratio_interpretation', '')}
 - Circularity: {sd.get('circularity', 0)} (<0.5 = irregular margin / suspicious)
 - Bounding box: {sd.get('bbox', [])}
 
-### Model Attention (Bottleneck Features)
-{bottleneck_text}
-Note: if the attention region diverges significantly from the segmentation bbox, this is a signal the model is uncertain.
-
 ### Clinical Coverage Note
 {unified.get('coverage_note', '')}
-{consensus_block}{icd10_block}
+{hard_conflict_block}{consensus_block}{icd10_block}{visual_flags_block}
 ### Retrieved Clinical Guidelines
 {rag_context}
 
@@ -290,65 +262,73 @@ Based on the findings and clinical guidelines, suggest next steps. Do NOT make a
 Start with: "AI-assisted suggestion (must be confirmed by radiologist):"
 {"Include both rule-based and AI reasoning perspectives, ending with the disagreement note above." if consensus is False else ""}
 {"Mention both ICD-10 codes and note the discrepancy requires radiologist review." if icd10_block else ""}
-
-Answer the user's question: "{question}"
 """
     return prompt.strip()
 
 
 def _build_cot_prompt(
-    top_label: str,
-    confidence: float,
-    all_scores: dict,
     spatial: dict,
-    bottleneck: dict,
+    visual_features: dict,
     rag_chunks: list,
     organ: str,
 ) -> str:
     """
-    Build the Chain-of-Thought prompt to reason independently of the mapper.
-    CoT MUST NOT know the mapper's result before reasoning.
-    Output is a JSON object matching the CoTResult schema.
+    Build the Chain-of-Thought prompt without CNN label.
+    CoT reasons ONLY from spatial features and clinical guidelines.
+    Uncertainty and Grad-CAM overlap flags are disabled -- Step 2 reflects
+    spatial-only flags when those metrics are inactive.
     """
     rag_text = "\n\n".join(rag_chunks) if rag_chunks else "No clinical guidelines available."
-    bottleneck_text = _format_bottleneck(bottleneck)
+    flags_text = "\n".join(f"  - {f}" for f in visual_features.get("clinical_flags", []))
+    if not flags_text:
+        flags_text = "  (no significant flags)"
+
+    area_val = spatial.get("area_cm2")
+    area_str = f"{area_val:.3f} cm2" if area_val is not None else "unavailable (no DICOM metadata)"
+
+    # TN3K has only benign/malignant labels; "normal" is not a valid class for thyroid.
+    if organ == "thyroid":
+        cot_label_options = '"benign" | "malignant"'
+    else:
+        cot_label_options = '"benign" | "malignant" | "normal"'
 
     return f"""You are analyzing a {organ} ultrasound image.
+You have NOT been told the CNN model's classification label.
+Reason ONLY from the imaging features and clinical guidelines below.
 
-Reason through the following data step by step, then output your conclusion as JSON.
-
-## Step 1: Classification Result
-- Top label: {top_label} (confidence: {confidence:.2%})
-- All scores: {json.dumps(all_scores)}
-
-## Step 2: Spatial Features
+## Step 1: Spatial Features (from segmentation mask)
 - Location: {spatial.get('location_quadrant', 'unknown')}
-- Area: {spatial.get('area_cm2', 0):.3f} cm2
-- Aspect ratio: {spatial.get('aspect_ratio', 0):.3f} (>1.5 suspicious)
-- Circularity: {spatial.get('circularity', 0):.3f} (<0.5 irregular margin)
+- Area: {area_str}
+- Aspect ratio: {spatial.get('aspect_ratio', 0):.3f} -- {spatial.get('aspect_ratio_interpretation', '')}
+- Circularity: {spatial.get('circularity', 0):.3f} (< 0.5 = irregular margin, suspicious)
 
-## Step 3: Model Attention
-{bottleneck_text}
-If attention hotspot differs significantly from the bbox, note model uncertainty.
+## Step 2: Spatial Flags (from segmentation mask)
+Clinical flags derived from spatial features:
+{flags_text}
 
-## Step 4: Clinical Guidelines (RAG)
+Risk modifier from flags: {visual_features.get('risk_modifier', 0):+d}
+(positive = additional suspicion; negative = reassuring)
+
+## Step 3: Clinical Guidelines (RAG)
 {rag_text}
 
-## Step 5: Conclude
-Based on all steps above, determine:
-- severity: one of "incidental" | "significant" | "urgent" | "critical"
+## Step 4: Conclude
+Based ONLY on the above (do not assume any CNN label), determine:
+- cot_label: your independent classification -- {cot_label_options}
+- severity: "incidental" | "significant" | "urgent" | "critical"
 - severity_level: integer 1-4 matching severity
-- icd10_hint: appropriate ICD-10 code for {organ} + {top_label}
-- risk_category: clinical risk description (e.g. "High suspicion (BI-RADS 4C-5)")
-- reasoning: full audit trail as a single string covering all 5 steps
+- icd10_hint: appropriate ICD-10 code for {organ} + your cot_label
+- risk_category: clinical risk description
+- reasoning: full audit trail covering each step above
 
-Output ONLY valid JSON, no markdown, no explanation outside JSON:
+Output ONLY valid JSON, no markdown, no text outside the JSON object:
 {{
+  "cot_label": "...",
   "severity": "...",
   "severity_level": 0,
   "icd10_hint": "...",
   "risk_category": "...",
-  "reasoning": "Step 1: ... Step 2: ... Step 3: ... Step 4: ... Step 5: ..."
+  "reasoning": "Step 1: ... Step 2: ... Step 3: ... Step 4: ..."
 }}"""
 
 
@@ -358,13 +338,7 @@ def _build_chat_prompt(
     history: list,
     message: str,
 ) -> str:
-    """
-    Build the multi-turn chatbot prompt from existing context + history.
-
-    unified_context: dict containing the unified output + report from the
-                      original analyze call.
-    history: list[dict] with keys 'role' and 'content'.
-    """
+    """Build the multi-turn chatbot prompt from existing context + history."""
     rag_context = (
         "\n\n".join(rag_chunks) if rag_chunks
         else "No additional clinical guidelines retrieved."
@@ -372,6 +346,9 @@ def _build_chat_prompt(
 
     report = unified_context.get("report", {})
     t1 = report.get("tier_1_structured", {})
+
+    area_val = t1.get("area_cm2")
+    area_str = f"{area_val:.3f} cm2" if area_val is not None else "unavailable"
 
     context_block = f"""
 ## Context: Previously Analyzed Image
@@ -382,7 +359,7 @@ Classification: {t1.get('label', '?')} ({t1.get('confidence', 0):.0%} confidence
 Risk category: {t1.get('risk_category', '?')}
 Severity: {t1.get('severity', '?')} (level {t1.get('severity_level', 0)}/4)
 Location: {t1.get('location_quadrant', '?')}
-Area: {t1.get('area_cm2', 0):.3f} cm2
+Area: {area_str}
 Aspect ratio: {t1.get('aspect_ratio', 1.0):.3f}
 Circularity: {t1.get('circularity', 1.0):.3f}
 ICD-10: {t1.get('icd10_hint', '?')}
@@ -406,17 +383,10 @@ Retrieved clinical guidelines:
     return f"{context_block}\n\n## Conversation History{history_block}\n\nUSER: {message}"
 
 
-# LangGraph nodes
-
 ALLOW_DEGRADED_ROUTER = os.getenv("ALLOW_DEGRADED_ROUTER", "false").lower() == "true"
 
 
 def make_route_node(router_url: str):
-    """
-    Async node - calls /route with a hint if provided.
-    hint_conflict/hint_resolution_note/final_decision_source are copied into
-    state so report_node can use them in tier_1_structured.
-    """
     async def route_node(state: OrchestratorState) -> dict:
         with get_tracer().start_as_current_span("graph.route") as span:
             span.set_attribute("image_id", state.get("image_id", ""))
@@ -457,9 +427,9 @@ def make_route_node(router_url: str):
                         ),
                     }
 
-                span.set_attribute("route.module_key",  result.get("module_key", ""))
-                span.set_attribute("route.organ",       result.get("organ", ""))
-                span.set_attribute("route.confidence",  result.get("confidence", 0.0))
+                span.set_attribute("route.module_key", result.get("module_key", ""))
+                span.set_attribute("route.organ", result.get("organ", ""))
+                span.set_attribute("route.confidence", result.get("confidence", 0.0))
                 return {"routing": result}
 
             except Exception as e:
@@ -469,20 +439,15 @@ def make_route_node(router_url: str):
 
 
 def make_vision_node(vision_url: str, registry=None):
-    """
-    registry: ModuleRegistry instance - reads facts from module_registry.yaml.
-    If None, falls back to a hardcoded dict (test/dev use only).
-    """
     async def vision_node(state: OrchestratorState) -> dict:
         if state.get("error"):
-            # Return an empty dict so LangGraph keeps the current state unchanged
             return {"model_output": state.get("model_output")}
         routing = state.get("routing") or {}
         organ = routing.get("organ", "breast")
         module_key = routing.get("module_key", "us_breast")
 
         with get_tracer().start_as_current_span("graph.vision") as span:
-            span.set_attribute("image_id",   state.get("image_id", ""))
+            span.set_attribute("image_id", state.get("image_id", ""))
             span.set_attribute("vision.organ", organ)
             try:
                 if registry is not None:
@@ -503,7 +468,7 @@ def make_vision_node(vision_url: str, registry=None):
                     state["image_bytes"],
                     fields={"organ": organ},
                 )
-                span.set_attribute("vision.top_label",  result.get("top_label", ""))
+                span.set_attribute("vision.top_label", result.get("top_label", ""))
                 span.set_attribute("vision.confidence", result.get("confidence", 0.0))
                 return {"model_output": result}
             except Exception as e:
@@ -512,18 +477,12 @@ def make_vision_node(vision_url: str, registry=None):
     return vision_node
 
 
-def make_spatial_node(knowledge_url: str):
+def make_spatial_node(knowledge_url: str, registry=None):
     """
-    Separates the spatial derive step (from the segmentation mask) out of
-    knowledge_node.
+    Computes spatial features from the segmentation mask.
 
-    Reason: spatial_derived (bbox, area, aspect_ratio, circularity) is computed
-    PURELY from the segmentation mask -- it has nothing to do with severity
-    mapping (rule-based). It used to only be available after knowledge_node
-    (running in parallel with cot_reasoning_node) finished, so cot_reasoning_node
-    always read spatial=None/empty (race condition). This node runs right
-    after vision, before fanning out to knowledge/cot_reasoning, so both see
-    the real spatial data instead of an empty {}.
+    registry: ModuleRegistry instance. When provided, uses
+    registry.knowledge_spatial_url; otherwise falls back to a constructed URL.
     """
     async def spatial_node(state: OrchestratorState) -> dict:
         if state.get("error"):
@@ -533,23 +492,26 @@ def make_spatial_node(knowledge_url: str):
         mo = state.get("model_output") or {}
 
         payload = {
-            "modality":            routing.get("modality", "ultrasound"),
-            "organ":               routing.get("organ", "breast"),
-            "top_label":           mo.get("top_label", "benign"),
-            "confidence":          mo.get("confidence", 0.0),
-            "all_scores":          mo.get("all_scores", {}),
-            "mask_png_base64":     mo.get("mask_png_base64", ""),
-            "original_size":       list(mo.get("original_size", [512, 512])),
-            "pixel_spacing_mm":    0.1,
-            "bottleneck_features": mo.get("bottleneck_features", {}),
+            "organ": routing.get("organ", "breast"),
+            "mask_png_base64": mo.get("mask_png_base64", ""),
+            "original_size": list(mo.get("original_size", [512, 512])),
+            "pixel_spacing_mm": state.get("pixel_spacing_mm"),
+            "laterality": state.get("laterality"),
         }
+
+        url = (
+            registry.knowledge_spatial_url
+            if registry is not None
+            else f"{knowledge_url}/map/spatial"
+        )
 
         with get_tracer().start_as_current_span("graph.spatial") as span:
             span.set_attribute("image_id", state.get("image_id", ""))
             try:
-                result = await _post_json_async(f"{knowledge_url}/map", payload)
+                result = await _post_json_async(url, payload)
                 spatial = result.get("spatial_derived", {})
-                span.set_attribute("spatial.area_cm2", spatial.get("area_cm2", 0.0))
+                area_val = spatial.get("area_cm2")
+                span.set_attribute("spatial.area_cm2", area_val or 0.0)
                 return {"spatial": spatial}
             except Exception as e:
                 span.record_exception(e)
@@ -557,7 +519,11 @@ def make_spatial_node(knowledge_url: str):
     return spatial_node
 
 
-def make_knowledge_node(knowledge_url: str):
+def make_knowledge_node(knowledge_url: str, registry=None):
+    """
+    registry: ModuleRegistry instance. When provided, uses
+    registry.knowledge_knowledge_url; otherwise falls back to a constructed URL.
+    """
     async def knowledge_node(state: OrchestratorState) -> dict:
         if state.get("error"):
             return {"knowledge": state.get("knowledge"), "spatial": state.get("spatial")}
@@ -566,37 +532,29 @@ def make_knowledge_node(knowledge_url: str):
         mo = state.get("model_output") or {}
 
         payload = {
-            "modality":            routing.get("modality", "ultrasound"),
-            "organ":               routing.get("organ", "breast"),
-            "top_label":           mo.get("top_label", "benign"),
-            "confidence":          mo.get("confidence", 0.0),
-            "all_scores":          mo.get("all_scores", {}),
-            "mask_png_base64":     mo.get("mask_png_base64", ""),
-            "original_size":       list(mo.get("original_size", [512, 512])),
-            "pixel_spacing_mm":    0.1,
-            # Pass-through bottleneck_features - the knowledge service doesn't
-            # process it, just forwards it so the orchestrator can use it in
-            # the CoT and qa_agent prompts
-            "bottleneck_features": mo.get("bottleneck_features", {}),
+            "modality": routing.get("modality", "ultrasound"),
+            "organ": routing.get("organ", "breast"),
+            "top_label": mo.get("top_label", "benign"),
+            "confidence": mo.get("confidence", 0.0),
+            "all_scores": mo.get("all_scores", {}),
         }
 
+        url = (
+            registry.knowledge_knowledge_url
+            if registry is not None
+            else f"{knowledge_url}/map/knowledge"
+        )
+
         with get_tracer().start_as_current_span("graph.knowledge") as span:
-            span.set_attribute("image_id",       state.get("image_id", ""))
+            span.set_attribute("image_id", state.get("image_id", ""))
             span.set_attribute("knowledge.organ", routing.get("organ", ""))
             span.set_attribute("knowledge.label", mo.get("top_label", ""))
             try:
-                result = await _post_json_async(f"{knowledge_url}/map", payload)
+                result = await _post_json_async(url, payload)
                 km = result.get("knowledge_mapped", {})
-                span.set_attribute("knowledge.severity",       km.get("severity", ""))
+                span.set_attribute("knowledge.severity", km.get("severity", ""))
                 span.set_attribute("knowledge.severity_level", km.get("severity_level", 0))
-                # spatial was already computed by spatial_node earlier and runs
-                # in parallel; still returned here for backward compatibility
-                # if spatial_node hasn't run (e.g. old AsyncSequentialFallback
-                # or state doesn't have spatial yet).
-                return {
-                    "knowledge": km,
-                    "spatial":   state.get("spatial") or result.get("spatial_derived", {}),
-                }
+                return {"knowledge": km}
             except Exception as e:
                 span.record_exception(e)
                 return {"error": f"[knowledge_node] {e}"}
@@ -606,8 +564,9 @@ def make_knowledge_node(knowledge_url: str):
 def make_cot_node(llm_client):
     """
     CoT reasoning node - runs in parallel with the knowledge node.
-    Does NOT read the mapper's result before reasoning.
-    Output must have the same structure as KnowledgeMapped so they're comparable.
+    Does NOT receive the CNN classification label -- reasons independently
+    from spatial features only (uncertainty and Grad-CAM overlap flags are
+    disabled pending more grounded proxy metrics).
     """
     async def cot_reasoning_node(state: OrchestratorState) -> dict:
         if state.get("error"):
@@ -621,20 +580,25 @@ def make_cot_node(llm_client):
         if not mo:
             return {"cot_result": None}
 
-        prompt = _build_cot_prompt(
-            top_label=mo.get("top_label", "benign"),
-            confidence=mo.get("confidence", 0.0),
-            all_scores=mo.get("all_scores", {}),
+        visual_features = interpret_visual_features(
+            bottleneck=mo.get("bottleneck_enriched", {}),
+            texture=mo.get("texture_features", {}),
+            uncertainty=mo.get("uncertainty", {}),
+            gradcam_overlap=mo.get("gradcam_mask_overlap", {}),
             spatial=sd,
-            bottleneck=mo.get("bottleneck_features", {}),
+            organ=routing.get("organ", "breast"),
+        )
+
+        prompt = _build_cot_prompt(
+            spatial=sd,
+            visual_features=visual_features,
             rag_chunks=rag_chunks,
             organ=routing.get("organ", "breast"),
         )
 
         with get_tracer().start_as_current_span("graph.cot_reasoning") as span:
-            span.set_attribute("image_id",    state.get("image_id", ""))
-            span.set_attribute("cot.organ",   routing.get("organ", ""))
-            span.set_attribute("cot.label",   mo.get("top_label", ""))
+            span.set_attribute("image_id", state.get("image_id", ""))
+            span.set_attribute("cot.organ", routing.get("organ", ""))
             raw = None
             try:
                 raw = await asyncio.to_thread(
@@ -642,8 +606,8 @@ def make_cot_node(llm_client):
                 )
                 clean = raw.strip().replace("```json", "").replace("```", "").strip()
                 parsed = json.loads(clean)
-
                 cot = {
+                    "cot_label":      str(parsed.get("cot_label", "unknown")),
                     "severity":       str(parsed.get("severity", "incidental")),
                     "severity_level": int(parsed.get("severity_level", 1)),
                     "icd10_hint":     str(parsed.get("icd10_hint", "R93.8")),
@@ -651,39 +615,52 @@ def make_cot_node(llm_client):
                     "reasoning":      str(parsed.get("reasoning", "")),
                 }
                 span.set_attribute("cot.severity_level", cot["severity_level"])
+                span.set_attribute("cot.cot_label", cot["cot_label"])
             except Exception as e:
                 span.record_exception(e)
                 raw_preview = raw[:200] if raw else ""
-                print(f"[cot_node] Parse error: {e}. Falling back to undetermined.")
                 cot = {
+                    "cot_label":      "unknown",
                     "severity":       "undetermined",
                     "severity_level": 0,
                     "icd10_hint":     "R93.8",
                     "risk_category":  "undetermined",
-                    "reasoning":      f"Parse error: {e}. Raw response: {raw_preview}",
+                    "reasoning":      f"Parse error: {e}. Raw: {raw_preview}",
                 }
 
-        return {"cot_result": cot}
+        return {
+            "cot_result":    cot,
+            "visual_flags":  visual_features.get("clinical_flags", []),
+            "risk_modifier": visual_features.get("risk_modifier", 0),
+        }
+
     return cot_reasoning_node
 
 
-def make_rag_node(rag_store):
+def make_rag_node(rag_store, rag_mode: str = "two_stage"):
     """
-    RAG node runs in parallel with the vision branch.
-    Uses the user's question for the query since vision hasn't finished yet.
+    RAG node. In two_stage mode, runs after spatial with query "{modality} {organ}".
+    In single_stage mode, returns empty chunks immediately (retrieve happens in
+    consistency_guard instead).
     """
     async def rag_node(state: OrchestratorState) -> OrchestratorState:
         if state.get("error"):
             return state
 
-        question = state.get("question", "")
+        if rag_mode == "single_stage":
+            state["rag_chunks"] = []
+            state["rag_meta"] = []
+            return state
+
         routing = state.get("routing") or {}
+        modality = routing.get("modality", "ultrasound")
         organ = routing.get("organ")
+        query = f"{modality} {organ}".strip() if organ else modality
 
         try:
             if rag_store and rag_store.is_ready():
                 meta_list = await asyncio.to_thread(
-                    rag_store.retrieve_with_meta, question, 5, organ
+                    rag_store.retrieve_with_meta, query, 100, organ
                 )
             else:
                 meta_list = []
@@ -699,26 +676,24 @@ def make_rag_node(rag_store):
 
 
 def make_merge_node():
-    """Waits for all three branches (knowledge, cot, rag) before passing to consistency_guard."""
+    """Waits for all three branches (knowledge, cot, rag) before consistency_guard."""
     async def merge_node(state: OrchestratorState) -> OrchestratorState:
         if state.get("error"):
             return state
         if not state.get("knowledge"):
             state["error"] = "[merge_node] knowledge output is missing -- vision/knowledge branch failed."
             return state
-
-        # Once knowledge is available, perform a second retrieve with a richer context.
-        # Does not call the LLM - just concatenates strings from existing fields.
         return state
     return merge_node
 
 
-def make_second_rag_retrieval(rag_store):
+def make_second_rag_retrieval(rag_store, rag_mode: str = "two_stage"):
     """
-    Second retrieve after the knowledge result is available (top_label, icd10_hint, organ).
-    Merges with the first retrieve and reranks all candidates.
+    Second retrieve after the knowledge result is available.
+    In two_stage mode: enriched query reranks candidates from first retrieve.
+    In single_stage mode: single retrieve + rerank using enriched query directly.
     """
-    async def second_retrieve(state: OrchestratorState, question: str) -> tuple:
+    async def second_retrieve(state: OrchestratorState) -> tuple:
         """
         Returns (all_chunks: list[str], all_meta: list[dict]) after merging and reranking.
         Called from consistency_guard_node, not a standalone LangGraph node.
@@ -729,13 +704,23 @@ def make_second_rag_retrieval(rag_store):
         km = state.get("knowledge") or {}
         routing = state.get("routing") or {}
         organ = routing.get("organ")
-
         mo = state.get("model_output") or {}
         top_label = mo.get("top_label", "")
         icd10 = km.get("icd10_hint", "")
 
-        # Second query concatenates context: question + label + organ + icd10
-        enriched_query = f"{question} {top_label} {organ or ''} {icd10}".strip()
+        enriched_query = f"{top_label} {organ or ''} ultrasound findings {icd10}".strip()
+
+        if rag_mode == "single_stage":
+            try:
+                meta_list = await asyncio.to_thread(
+                    rag_store.retrieve_with_meta, enriched_query, 3, organ
+                )
+            except Exception as e:
+                print(f"[second_rag single_stage] Retrieve error: {e}")
+                meta_list = []
+            reranked = rag_store.rerank(enriched_query, meta_list, top_n=3)
+            chunks = [m["chunk"] for m in reranked]
+            return chunks, reranked
 
         try:
             meta2 = await asyncio.to_thread(
@@ -745,7 +730,6 @@ def make_second_rag_retrieval(rag_store):
             print(f"[second_rag] Second retrieve error: {e}")
             meta2 = []
 
-        # Merge both retrieves, dedup chunks by content
         existing_meta = state.get("rag_meta") or []
         existing_texts = {m["chunk"] for m in existing_meta}
         combined = list(existing_meta)
@@ -754,42 +738,37 @@ def make_second_rag_retrieval(rag_store):
                 combined.append(m)
                 existing_texts.add(m["chunk"])
 
-        # Rerank all candidates, keep top 3
-        reranked = rag_store.rerank(question, combined, top_n=3)
+        reranked = rag_store.rerank(enriched_query, combined, top_n=3)
         chunks = [m["chunk"] for m in reranked]
         return chunks, reranked
 
     return second_retrieve
 
 
-def make_consistency_guard_node(rag_store):
+def make_consistency_guard_node(rag_store, rag_mode: str = "two_stage"):
     """
-    New node placed between merge and qa_agent.
-    1. Performs the second RAG retrieve with a richer context.
-    2. Compares mapper and CoT severity_level, sets the consensus flag.
-    3. Separately compares mapper and CoT icd10_hint, sets the icd10_agreement flag.
-
-    consensus and icd10_agreement are two different clinical questions
-    (severity vs disease code) so they are not collapsed into a single flag.
+    1. Performs the second RAG retrieve with enriched context.
+    2. Compares mapper and CoT severity_level -> sets consensus flag.
+    3. Compares mapper and CoT icd10_hint -> sets icd10_agreement flag.
+    4. Compares CNN label vs CoT label -> sets label_agreement and hard_conflict.
     """
-    second_retrieve = make_second_rag_retrieval(rag_store)
+    second_retrieve = make_second_rag_retrieval(rag_store, rag_mode)
 
     async def consistency_guard_node(state: OrchestratorState) -> OrchestratorState:
         if state.get("error"):
             return state
 
-        question = state.get("question", "")
-
         with get_tracer().start_as_current_span("graph.consistency_guard") as span:
             span.set_attribute("image_id", state.get("image_id", ""))
 
-            final_chunks, final_meta = await second_retrieve(state, question)
+            final_chunks, final_meta = await second_retrieve(state)
             state["rag_chunks"] = final_chunks
-            state["rag_meta"]   = final_meta
+            state["rag_meta"] = final_meta
 
             mapper = state.get("knowledge") or {}
             mapper_level = mapper.get("severity_level", 0)
             mapper_icd10 = mapper.get("icd10_hint")
+
             cot = state.get("cot_result") or {}
             cot_level = cot.get("severity_level", 0)
             cot_icd10 = cot.get("icd10_hint")
@@ -808,12 +787,30 @@ def make_consistency_guard_node(rag_store):
             else:
                 state["icd10_agreement"] = mapper_icd10 == cot_icd10
 
+            cnn_label = (state.get("model_output") or {}).get("top_label", "unknown")
+            cot_label = cot.get("cot_label", "unknown")
+
+            if cot_undetermined or cot_label == "unknown":
+                state["label_agreement"] = None
+                state["hard_conflict"] = None
+            else:
+                state["label_agreement"] = (cnn_label.lower() == cot_label.lower())
+                state["hard_conflict"] = (
+                    not state["label_agreement"]  # label disagrees...
+                    and (
+                        abs(mapper_level - cot_level) > 1  # ...AND severity diverges
+                        or (cot_label in ("malignant",) and cnn_label in ("benign", "normal"))  # ...OR benign↔malignant flip
+                    )
+                )
+
             span.set_attribute("guard.mapper_level", mapper_level)
-            span.set_attribute("guard.cot_level",    cot_level)
+            span.set_attribute("guard.cot_level", cot_level)
             span.set_attribute("guard.mapper_icd10", mapper_icd10 or "")
-            span.set_attribute("guard.cot_icd10",    cot_icd10 or "")
-            span.set_attribute("guard.consensus",    str(state["consensus"]))
-            span.set_attribute("guard.icd10_agreement", str(state["icd10_agreement"]))
+            span.set_attribute("guard.cot_icd10", cot_icd10 or "")
+            span.set_attribute("guard.consensus", str(state.get("consensus")))
+            span.set_attribute("guard.icd10_agreement", str(state.get("icd10_agreement")))
+            span.set_attribute("guard.label_agreement", str(state.get("label_agreement")))
+            span.set_attribute("guard.hard_conflict", str(state.get("hard_conflict")))
 
         return state
     return consistency_guard_node
@@ -825,34 +822,41 @@ def make_qa_agent_node(llm_client, rag_store):
         if state.get("error"):
             return state
 
-        routing    = state.get("routing") or {}
-        mo         = state.get("model_output") or {}
-        km         = state.get("knowledge") or {}
-        sd         = state.get("spatial") or {}
+        routing = state.get("routing") or {}
+        mo = state.get("model_output") or {}
+        km = state.get("knowledge") or {}
+        sd = state.get("spatial") or {}
         rag_chunks = state.get("rag_chunks") or []
-        rag_meta   = state.get("rag_meta") or []
+        rag_meta = state.get("rag_meta") or []
         cot_result = state.get("cot_result")
-        consensus  = state.get("consensus")
+        consensus = state.get("consensus")
         icd10_agreement = state.get("icd10_agreement")
+        hard_conflict = state.get("hard_conflict")
+        visual_flags = state.get("visual_flags") or []
+        risk_modifier = state.get("risk_modifier") or 0
 
         unified = {
-            "modality":         routing.get("modality", "ultrasound"),
-            "organ":            routing.get("organ", "breast"),
-            "image_id":         state["image_id"],
-            "model_output":     mo,
+            "modality": routing.get("modality", "ultrasound"),
+            "organ": routing.get("organ", "breast"),
+            "image_id": state["image_id"],
+            "model_output": mo,
             "knowledge_mapped": km,
-            "spatial_derived":  sd,
-            "coverage_note":    "Model trained on BUSI dataset (benign/malignant/normal only).",
+            "spatial_derived": sd,
+            "coverage_note": "Model trained on BUSI dataset (benign/malignant/normal only).",
         }
 
         prompt = _build_report_prompt(
-            unified, state["question"], rag_chunks, cot_result, consensus, icd10_agreement
+            unified, rag_chunks, cot_result, consensus, icd10_agreement,
+            visual_flags=visual_flags,
+            risk_modifier=risk_modifier,
+            hard_conflict=hard_conflict,
         )
 
         with get_tracer().start_as_current_span("graph.qa_agent") as span:
-            span.set_attribute("image_id",          state.get("image_id", ""))
-            span.set_attribute("qa.consensus",       str(consensus))
+            span.set_attribute("image_id", state.get("image_id", ""))
+            span.set_attribute("qa.consensus", str(consensus))
             span.set_attribute("qa.icd10_agreement", str(icd10_agreement))
+            span.set_attribute("qa.hard_conflict", str(hard_conflict))
             span.set_attribute("qa.rag_chunks_used", len(rag_chunks))
             try:
                 llm_response = await asyncio.to_thread(
@@ -872,23 +876,30 @@ def make_qa_agent_node(llm_client, rag_store):
             tier1_icd10_hint = mapper_icd10
 
         tier1 = {
-            "modality":           routing.get("modality", "ultrasound"),
-            "organ":              routing.get("organ", "breast"),
-            "label":              mo.get("top_label", "unknown"),
-            "confidence":         mo.get("confidence", 0.0),
-            "risk_category":      km.get("risk_category", "unknown"),
-            "severity":           km.get("severity", "unknown"),
-            "severity_level":     km.get("severity_level", 1),
-            "icd10_hint":         tier1_icd10_hint,
-            "location_quadrant":  sd.get("location_quadrant", "unknown"),
-            "bbox":               sd.get("bbox", [0, 0, 0, 0]),
-            "area_cm2":           sd.get("area_cm2", 0.0),
-            "aspect_ratio":       sd.get("aspect_ratio", 1.0),
-            "circularity":        sd.get("circularity", 1.0),
+            "modality": routing.get("modality", "ultrasound"),
+            "organ": routing.get("organ", "breast"),
+            "label": mo.get("top_label", "unknown"),
+            "confidence": mo.get("confidence", 0.0),
+            "risk_category": km.get("risk_category", "unknown"),
+            "severity": km.get("severity", "unknown"),
+            "severity_level": km.get("severity_level", 1),
+            "icd10_hint": tier1_icd10_hint,
+            "location_quadrant": sd.get("location_quadrant", "unknown"),
+            "bbox": sd.get("bbox", [0, 0, 0, 0]),
+            "area_cm2": sd.get("area_cm2"),
+            "pixel_spacing_reliable": sd.get("pixel_spacing_reliable", False),
+            "aspect_ratio": sd.get("aspect_ratio", 1.0),
+            "aspect_ratio_interpretation": sd.get("aspect_ratio_interpretation", ""),
+            "circularity": sd.get("circularity", 1.0),
             "confidence_calibration_note": km.get("confidence_calibration_note"),
-            "hint_conflict":          routing.get("hint_conflict", False),
-            "hint_resolution_note":   routing.get("hint_resolution_note"),
-            "icd10_agreement":        icd10_agreement,
+            "hint_conflict": routing.get("hint_conflict", False),
+            "hint_resolution_note": routing.get("hint_resolution_note"),
+            "icd10_agreement": icd10_agreement,
+            "gradcam_png_base64": mo.get("gradcam_png_base64", ""),
+            "visual_flags": visual_flags,
+            "risk_modifier": risk_modifier,
+            "label_agreement": state.get("label_agreement"),
+            "hard_conflict": hard_conflict,
         }
 
         rag_sources = [
@@ -897,31 +908,30 @@ def make_qa_agent_node(llm_client, rag_store):
         ]
 
         state["report"] = {
-            "image_id":                        state["image_id"],
-            "tier_1_structured":               tier1,
+            "image_id": state["image_id"],
+            "tier_1_structured": tier1,
             "tier_2_radiological_description": tier2,
-            "tier_3_diagnostic_suggestion":    tier3,
-            "rag_sources":                     rag_sources,
+            "tier_3_diagnostic_suggestion": tier3,
+            "rag_sources": rag_sources,
             "rag_disabled_warning": (
                 None if (rag_store and rag_store.is_ready()) else
                 "RAG context not available -- report generated from classification "
                 "label and hardcoded mapping only, without clinical guideline retrieval."
             ),
-            "mapper_result":          km,
-            "cot_result":             cot_result,
-            "consensus":              consensus,
-            "icd10_agreement":        icd10_agreement,
-            "_rag_chunks_internal":   rag_chunks,
+            "mapper_result": km,
+            "cot_result": cot_result,
+            "consensus": consensus,
+            "icd10_agreement": icd10_agreement,
+            "hard_conflict": hard_conflict,
+            "label_agreement": state.get("label_agreement"),
+            "_rag_chunks_internal": rag_chunks,
         }
         return state
     return qa_agent_node
 
 
 def _parse_tiers(llm_text: str) -> tuple:
-    """
-    Parse the LLM response -> (tier2_text, tier3_text).
-    Looks for 'TIER 2' and 'TIER 3' markers, falls back to a midpoint split if not found.
-    """
+    """Parse the LLM response -> (tier2_text, tier3_text)."""
     text = llm_text.strip()
     t2_start = -1
     t3_start = -1
@@ -964,69 +974,55 @@ def _parse_tiers(llm_text: str) -> tuple:
     )
 
 
-# Building and compiling the graph
-
 def build_graph(services_cfg: dict, llm_client, rag_store, registry=None):
     """
-    Build and compile the LangGraph pipeline with real fan-out/fan-in.
+    Build and compile the LangGraph pipeline.
 
     Args:
-        services_cfg: {
-            'router_url':    'http://router:8001',
-            'vision_url':    'http://vision:8002',
-            'knowledge_url': 'http://knowledge:8003',
-        }
-        llm_client:  BaseLLMClient instance
-        rag_store:   FAISSStore instance
-        registry:    ModuleRegistry instance, reads facts from module_registry.yaml.
-
-    Returns a compiled async graph (or AsyncSequentialFallback if langgraph is unavailable).
+        services_cfg: dict with router_url, vision_url, knowledge_url
+        llm_client:   BaseLLMClient instance
+        rag_store:    FAISSStore instance
+        registry:     ModuleRegistry instance
     """
-    router_url    = services_cfg.get("router_url",    "http://router:8001")
-    vision_url    = services_cfg.get("vision_url",    "http://vision:8002")
+    router_url = services_cfg.get("router_url", "http://router:8001")
+    vision_url = services_cfg.get("vision_url", "http://vision:8002")
     knowledge_url = services_cfg.get("knowledge_url", "http://knowledge:8003")
 
-    route_node              = make_route_node(router_url)
-    vision_node             = make_vision_node(vision_url, registry=registry)
-    spatial_node            = make_spatial_node(knowledge_url)
-    knowledge_node          = make_knowledge_node(knowledge_url)
-    cot_node                = make_cot_node(llm_client)
-    rag_node                = make_rag_node(rag_store)
-    merge_node              = make_merge_node()
-    consistency_guard_node  = make_consistency_guard_node(rag_store)
-    qa_agent_node           = make_qa_agent_node(llm_client, rag_store)
+    rag_mode = os.getenv("RAG_MODE", "two_stage")
+
+    route_node = make_route_node(router_url)
+    vision_node = make_vision_node(vision_url, registry=registry)
+    spatial_node = make_spatial_node(knowledge_url, registry=registry)
+    knowledge_node = make_knowledge_node(knowledge_url, registry=registry)
+    cot_node = make_cot_node(llm_client)
+    rag_node = make_rag_node(rag_store, rag_mode=rag_mode)
+    merge_node = make_merge_node()
+    consistency_guard_node = make_consistency_guard_node(rag_store, rag_mode=rag_mode)
+    qa_agent_node = make_qa_agent_node(llm_client, rag_store)
 
     if LANGGRAPH_AVAILABLE:
         g = StateGraph(OrchestratorState)
-        g.add_node("route",             route_node)
-        g.add_node("vision",            vision_node)
-        g.add_node("spatial",           spatial_node)
-        g.add_node("knowledge",         knowledge_node)
-        g.add_node("cot_reasoning",     cot_node)
-        g.add_node("rag_retrieve",      rag_node)
-        g.add_node("merge",             merge_node)
+        g.add_node("route", route_node)
+        g.add_node("vision", vision_node)
+        g.add_node("spatial", spatial_node)
+        g.add_node("knowledge", knowledge_node)
+        g.add_node("cot_reasoning", cot_node)
+        g.add_node("rag_retrieve", rag_node)
+        g.add_node("merge", merge_node)
         g.add_node("consistency_guard", consistency_guard_node)
-        g.add_node("qa_agent",          qa_agent_node)
+        g.add_node("qa_agent", qa_agent_node)
 
         g.set_entry_point("route")
-
-        # Fan-out: vision and rag run in parallel after route
-        g.add_edge("route",   "vision")
-        g.add_edge("route",   "rag_retrieve")
-        # spatial runs right after vision, BEFORE fanning out to knowledge/cot_reasoning,
-        # so both branches see the real spatial_derived data (avoids the old race
-        # condition -- cot_reasoning used to always read spatial={} because it ran
-        # in parallel with knowledge_node, the only node computing spatial at the time).
-        g.add_edge("vision",  "spatial")
+        g.add_edge("route", "vision")
+        g.add_edge("vision", "spatial")
         g.add_edge("spatial", "knowledge")
-        # CoT runs after spatial (needs model_output + spatial) but in parallel with knowledge
-        g.add_edge("spatial", "cot_reasoning")
+        g.add_edge("spatial", "rag_retrieve")
+        g.add_edge("rag_retrieve", "cot_reasoning")
 
-        # Fan-in: merge waits for ALL THREE branches
         g.add_edge(["knowledge", "cot_reasoning", "rag_retrieve"], "merge")
-        g.add_edge("merge",             "consistency_guard")
+        g.add_edge("merge", "consistency_guard")
         g.add_edge("consistency_guard", "qa_agent")
-        g.add_edge("qa_agent",          END)
+        g.add_edge("qa_agent", END)
 
         return g.compile()
     else:
@@ -1043,26 +1039,13 @@ def build_graph(services_cfg: dict, llm_client, rag_store, registry=None):
 class AsyncSequentialFallback:
     """
     Fallback when langgraph is not installed.
-    Mirrors build_graph's real edges exactly: route -> vision -> spatial ->
-    {knowledge, cot_reasoning} run in parallel (both depend only on spatial's
-    output, not on each other) -> merge waits for knowledge + cot_reasoning +
-    rag_retrieve -> consistency_guard -> qa_agent.
+    Mirrors build_graph edges: route -> vision -> spatial ->
+    {knowledge, rag_retrieve} in parallel -> cot_reasoning -> merge ->
+    consistency_guard -> qa_agent.
 
-    IMPORTANT: route_node, vision_node, spatial_node, knowledge_node, and
-    cot_node all return a PARTIAL dict (e.g. {"routing": ...} or
-    {"error": ...}), not the full state -- this is the real LangGraph
-    contract, since LangGraph merges partial returns into shared state via
-    the Annotated[..., reducer] fields on OrchestratorState. This fallback
-    must replicate that merging manually (state.update(partial)) instead of
-    replacing state outright, or keys like image_bytes/question/image_id
-    silently disappear after the first node runs. rag_node, merge_node,
-    consistency_guard_node, and qa_agent_node are the exception -- they take
-    and return the full state directly (see their signatures in this file).
-
-    cot_node MUST run on a state snapshot taken before knowledge_node executes,
-    not after -- otherwise CoT would see the mapper's result (severity,
-    icd10_hint) before reasoning, defeating the whole point of comparing two
-    independent assessments (see make_cot_node's docstring).
+    cot_node runs after rag_retrieve (so its prompt's clinical-guidelines
+    step is populated) but on a snapshot with knowledge set to None, so
+    CoT never sees the CNN-driven mapper result before reasoning.
     """
 
     def __init__(
@@ -1074,7 +1057,7 @@ class AsyncSequentialFallback:
         consistency_guard_node,
         qa_agent_node,
     ):
-        self.image_nodes = image_nodes          # [route, vision, spatial, knowledge]
+        self.image_nodes = image_nodes
         self.cot_node = cot_node
         self.rag_node = rag_node
         self.merge_node = merge_node
@@ -1084,10 +1067,6 @@ class AsyncSequentialFallback:
     async def ainvoke(self, state: dict) -> dict:
         import copy
 
-        # Step 1: route -- merge its partial dict into state, don't replace state.
-        # Indexed (not destructured) so an error-path test can supply a
-        # shorter image_nodes list and still short-circuit safely below,
-        # without ever needing to unpack the rest of the list.
         route_node = self.image_nodes[0]
         state.update(await route_node(state))
         if state.get("error"):
@@ -1095,93 +1074,86 @@ class AsyncSequentialFallback:
 
         vision_node, spatial_node, knowledge_node = self.image_nodes[1:]
 
-        # Step 2: vision and rag run in parallel after route
-        state_for_rag = copy.deepcopy(state)
-        vision_partial, rag_result = await asyncio.gather(
-            vision_node(state),
-            self.rag_node(state_for_rag),
-        )
-        state.update(vision_partial)
-        state["rag_chunks"] = rag_result.get("rag_chunks", [])
-        state["rag_meta"]   = rag_result.get("rag_meta", [])
-
+        state.update(await vision_node(state))
         if state.get("error"):
             return state
 
-        # Step 3: spatial runs right after vision, before fanning out to
-        # knowledge/cot_reasoning, so both see the real spatial_derived data
         state.update(await spatial_node(state))
         if state.get("error"):
             return state
 
-        # Step 4: knowledge and cot_reasoning run in parallel, each on its own
-        # deepcopy of the SAME pre-knowledge state -- cot_node must never see
-        # state["knowledge"] before it finishes reasoning.
-        state_for_cot = copy.deepcopy(state)
-        knowledge_partial, cot_partial = await asyncio.gather(
-            knowledge_node(state),
-            self.cot_node(state_for_cot),
+        state_for_knowledge = copy.deepcopy(state)
+        state_for_rag = copy.deepcopy(state)
+        knowledge_partial, rag_result = await asyncio.gather(
+            knowledge_node(state_for_knowledge),
+            self.rag_node(state_for_rag),
         )
         state.update(knowledge_partial)
+        state["rag_chunks"] = rag_result.get("rag_chunks", [])
+        state["rag_meta"] = rag_result.get("rag_meta", [])
+
+        state_for_cot = copy.deepcopy(state)
+        state_for_cot["knowledge"] = None
+        cot_partial = await self.cot_node(state_for_cot)
         if not state.get("error"):
             state["cot_result"] = cot_partial.get("cot_result")
+            state["visual_flags"] = cot_partial.get("visual_flags", [])
+            state["risk_modifier"] = cot_partial.get("risk_modifier", 0)
 
         if state.get("error"):
             return state
 
-        # Step 5: merge (fan-in for knowledge + cot_reasoning + rag_retrieve)
-        # merge_node/consistency_guard_node/qa_agent_node take and return the
-        # full state directly, unlike the partial-dict nodes above.
         state = await self.merge_node(state)
         if state.get("error"):
             return state
 
-        # Step 6: consistency_guard (second RAG + compare)
         state = await self.consistency_guard_node(state)
         if state.get("error"):
             return state
 
-        # Step 7: qa_agent
         state = await self.qa_agent_node(state)
         return state
 
 
-# External pipeline entry points
-
 async def run_pipeline_async(
     graph,
     image_bytes: bytes,
-    question: str,
     image_id: str = None,
     modality_hint: str = None,
     organ_hint: str = None,
+    pixel_spacing_mm: float = None,
+    laterality: str = None,
 ) -> dict:
     """
     Run the entire pipeline from bytes -> ReportOutput dict (async).
 
-    Used by the FastAPI async handler - do not call asyncio.run() nested
-    inside an already-async context (will raise a runtime error).
+    Used by the FastAPI async handler.
     """
     if image_id is None:
         image_id = uuid.uuid4().hex[:12]
 
     initial_state: OrchestratorState = {
-        "image_bytes":   image_bytes,
-        "question":      question,
-        "image_id":      image_id,
+        "image_bytes": image_bytes,
+        "image_id": image_id,
         "modality_hint": modality_hint,
-        "organ_hint":    organ_hint,
-        "routing":       None,
-        "model_output":  None,
-        "knowledge":     None,
-        "spatial":       None,
-        "cot_result":    None,
-        "rag_chunks":    [],
-        "rag_meta":      [],
-        "consensus":     None,
+        "organ_hint": organ_hint,
+        "pixel_spacing_mm": pixel_spacing_mm,
+        "laterality": laterality,
+        "routing": None,
+        "model_output": None,
+        "knowledge": None,
+        "spatial": None,
+        "cot_result": None,
+        "rag_chunks": [],
+        "rag_meta": [],
+        "consensus": None,
         "icd10_agreement": None,
-        "report":        None,
-        "error":         None,
+        "label_agreement": None,
+        "hard_conflict": None,
+        "visual_flags": [],
+        "risk_modifier": 0,
+        "report": None,
+        "error": None,
     }
 
     final_state = await graph.ainvoke(initial_state)
@@ -1195,15 +1167,14 @@ async def run_pipeline_async(
 def run_pipeline(
     graph,
     image_bytes: bytes,
-    question: str,
     image_id: str = None,
     modality_hint: str = None,
     organ_hint: str = None,
+    pixel_spacing_mm: float = None,
+    laterality: str = None,
 ) -> dict:
-    """
-    Sync version of run_pipeline_async - only used outside FastAPI
-    (e.g. a manual script). Inside FastAPI, use run_pipeline_async.
-    """
+    """Sync wrapper of run_pipeline_async -- only for use outside FastAPI."""
     return asyncio.run(run_pipeline_async(
-        graph, image_bytes, question, image_id, modality_hint, organ_hint
+        graph, image_bytes, image_id, modality_hint, organ_hint,
+        pixel_spacing_mm, laterality,
     ))

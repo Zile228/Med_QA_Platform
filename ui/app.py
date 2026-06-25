@@ -52,15 +52,14 @@ HINT_OPTIONS = {
 
 def call_orchestrator(
     image_pil: Image.Image,
-    question: str,
     organ_hint: str = None,
 ) -> dict:
-    """Send image + question + hint -> ReportOutput dict."""
+    """Send image + hint -> ReportOutput dict."""
     buf = io.BytesIO()
     image_pil.save(buf, format="PNG")
     buf.seek(0)
 
-    data = {"question": question}
+    data = {}
     if organ_hint:
         data["organ_hint"] = organ_hint
 
@@ -155,6 +154,26 @@ def build_warning_banners(report: dict, t1: dict) -> str:
     the findings content.
     """
     banners = ""
+
+    if report.get("hard_conflict") is True:
+        mapper_r = report.get("mapper_result") or {}
+        cot_r    = report.get("cot_result") or {}
+        t1_d     = report.get("tier_1_structured") or {}
+        cnn_lbl  = html.escape(str(t1_d.get("label", "?")))
+        cot_lbl  = html.escape(str(cot_r.get("cot_label", "?"))) if isinstance(cot_r, dict) else "?"
+        banners += f"""
+<div style="background:#3a0a0a; border-left:6px solid #f38ba8; padding:14px 16px;
+            border-radius:4px; color:#ff9eae; font-size:13px; margin-bottom:10px;">
+  <b>MANDATORY RADIOLOGIST REVIEW</b><br>
+  CNN model classified this as <b>{cnn_lbl}</b>, but independent AI reasoning
+  classified this as <b>{cot_lbl}</b>, and severity levels differ by more than 1 point.
+  This report must not be used for clinical decision-making without radiologist confirmation.
+  <br>Rule engine: severity={html.escape(str(mapper_r.get('severity','?')))} (level {html.escape(str(mapper_r.get('severity_level','?')))}),
+  ICD-10={html.escape(str(mapper_r.get('icd10_hint','?')))}.
+  CoT: severity={html.escape(str(cot_r.get('severity','?') if isinstance(cot_r,dict) else '?'))} (level {html.escape(str(cot_r.get('severity_level','?') if isinstance(cot_r,dict) else '?'))}),
+  ICD-10={html.escape(str(cot_r.get('icd10_hint','?') if isinstance(cot_r,dict) else '?'))}.
+</div>
+"""
 
     if t1.get("hint_conflict"):
         note = html.escape(t1.get("hint_resolution_note") or "")
@@ -271,9 +290,9 @@ def build_document_report_html(report: dict) -> str:
   <div style="background:#1e1e2e; color:#cdd6f4; margin-bottom:14px;">
     <span style="color:#a6e3a1; font-weight:bold;">Spatial Measurements</span><br>
     Location: <b>{html.escape(t1.get('location_quadrant','?'))}</b>
-    &nbsp; | &nbsp; Area: <b>{t1.get('area_cm2',0):.3f} cm2</b>
+    &nbsp; | &nbsp; Area: <b>{f"{t1['area_cm2']:.3f} cm2" if t1.get('area_cm2') is not None else "unavailable (no DICOM metadata)"}</b>
     &nbsp; | &nbsp; Aspect ratio: {t1.get('aspect_ratio',0):.3f}
-    {'&nbsp;<span style="color:#f38ba8">[elongated]</span>' if t1.get('aspect_ratio',0) > 1.5 else ''}
+    {f'&nbsp;<span style="color:#a6adc8; font-size:11px;">[{html.escape(t1.get("aspect_ratio_interpretation",""))}]</span>' if t1.get('aspect_ratio_interpretation') else ''}
     &nbsp; | &nbsp; Circularity: {t1.get('circularity',0):.3f}
     {'&nbsp;<span style="color:#f38ba8">[irregular margin]</span>' if t1.get('circularity',0) < 0.5 else ''}
   </div>
@@ -347,14 +366,12 @@ def run_analysis(
             )
         image_pil = Image.open(image_pil).copy()
     # --- End normalisation ---
-    question = EXAMPLE_QUESTIONS[0]
-
     organ_hint = HINT_OPTIONS.get(hint_display or "Auto-detect")
 
     progress(0.1, desc="Sending to orchestrator...")
 
     try:
-        report = call_orchestrator(image_pil, question, organ_hint=organ_hint)
+        report = call_orchestrator(image_pil, organ_hint=organ_hint)
     except gr.Error:
         raise
     except Exception as e:

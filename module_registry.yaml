@@ -1,6 +1,3 @@
-# Module Registry - each entry = 1 service
-# The orchestrator reads this file to know which service to call for which modality
-
 version: "1.0"
 
 services:
@@ -25,7 +22,10 @@ services:
 
   knowledge:
     url: "http://knowledge:8003"
-    endpoint: "/map"
+    endpoints:
+      spatial: "/map/spatial"
+      knowledge: "/map/knowledge"
+      legacy_map: "/map"
     description: "Severity mapping + spatial feature derivation"
 
   orchestrator:

@@ -27,7 +27,6 @@ from services.orchestrator.graph import (
 def _base_state(**overrides) -> dict:
     state = {
         "image_bytes":   b"fake",
-        "question":      "What are the findings?",
         "image_id":      "test_123",
         "modality_hint": None,
         "organ_hint":    None,
@@ -36,12 +35,20 @@ def _base_state(**overrides) -> dict:
                           "hint_conflict": False, "hint_resolution_note": None},
         "model_output":  {"top_label": "benign", "confidence": 0.8,
                           "all_scores": {"benign": 0.8}, "mask_png_base64": "",
-                          "original_size": [512, 512], "bottleneck_features": {}},
+                          "original_size": [512, 512],
+                          "bottleneck_enriched": {},
+                          "gradcam_png_base64": "",
+                          "gradcam_mask_overlap": {},
+                          "texture_features": {},
+                          "uncertainty": {},
+                          "filtered_findings": []},
         "knowledge":     {"severity": "significant", "severity_level": 2,
                           "icd10_hint": "N63.0", "risk_category": "BI-RADS 3",
                           "description": "Benign", "confidence_calibration_note": None},
         "spatial":       {"location_quadrant": "upper-outer", "bbox": [10, 10, 50, 50],
-                          "area_cm2": 1.0, "aspect_ratio": 1.1, "circularity": 0.9,
+                          "area_cm2": 1.0, "pixel_spacing_reliable": False,
+                          "aspect_ratio": 1.1, "aspect_ratio_interpretation": "intermediate",
+                          "circularity": 0.9,
                           "centroid": [30, 30], "width_px": 40, "height_px": 40,
                           "location_confidence": "high"},
         "cot_result":    None,
@@ -49,6 +56,10 @@ def _base_state(**overrides) -> dict:
         "rag_meta":      [],
         "consensus":     None,
         "icd10_agreement": None,
+        "label_agreement": None,
+        "hard_conflict": None,
+        "visual_flags":  [],
+        "risk_modifier": 0,
         "report":        None,
         "error":         None,
     }
@@ -90,18 +101,19 @@ class MockRAGStore:
 
 # RAG node
 
-def test_rag_node_query_uses_user_question_not_classification_label():
+def test_rag_node_query_uses_modality_organ():
     """
-    rag_node must use the user's original question as the query, NOT
-    organ/top_label (since vision hasn't finished running yet at that point).
+    In two_stage mode, rag_node runs before vision finishes and uses
+    "{modality} {organ}" from the routing result as the initial broad query.
+    The enriched query (with top_label + icd10) happens in consistency_guard.
     """
     store = MockRAGStore()
     rag_node = make_rag_node(store)
 
-    state = _base_state(question="Is this lesion malignant?")
+    state = _base_state()
     result = asyncio.run(rag_node(state))
 
-    assert store.last_query == "Is this lesion malignant?"
+    assert store.last_query == "ultrasound breast"
     assert "benign" not in (store.last_query or "")
     assert "us_breast" not in (store.last_query or "")
     assert result["rag_chunks"] == ["chunk A", "chunk B"]
@@ -134,7 +146,7 @@ def test_rag_node_skips_when_error_already_set():
 
 class MockLLMForCoT:
     def generate(self, prompt, system=None):
-        return ('{"severity": "incidental", "severity_level": 1, '
+        return ('{"cot_label": "benign", "severity": "incidental", "severity_level": 1, '
                 '"icd10_hint": "N63.0", "risk_category": "low", "reasoning": "test"}')
 
 
@@ -202,7 +214,7 @@ def test_consistency_guard_consensus_true_when_levels_match():
     guard = make_consistency_guard_node(store)
     # Mapper: level 2, CoT: level 2 -> agreement
     state = _base_state(
-        cot_result={"severity": "significant", "severity_level": 2,
+        cot_result={"cot_label": "benign", "severity": "significant", "severity_level": 2,
                     "icd10_hint": "N63.0", "risk_category": "BI-RADS 3",
                     "reasoning": "test"},
     )
@@ -215,7 +227,7 @@ def test_consistency_guard_consensus_false_when_levels_differ_much():
     guard = make_consistency_guard_node(store)
     # Mapper: level 2, CoT: level 4 -> disagreement (differ by 2)
     state = _base_state(
-        cot_result={"severity": "critical", "severity_level": 4,
+        cot_result={"cot_label": "malignant", "severity": "critical", "severity_level": 4,
                     "icd10_hint": "C50.9", "risk_category": "BI-RADS 5",
                     "reasoning": "test"},
     )
@@ -233,7 +245,7 @@ def test_icd10_agreement_false_when_codes_differ_even_if_levels_match():
     guard = make_consistency_guard_node(store)
     # Mapper: level 2, icd10 N63.0 (benign). CoT: level 2, icd10 C50.9 (malignant).
     state = _base_state(
-        cot_result={"severity": "significant", "severity_level": 2,
+        cot_result={"cot_label": "malignant", "severity": "significant", "severity_level": 2,
                     "icd10_hint": "C50.9", "risk_category": "BI-RADS 5",
                     "reasoning": "test"},
     )
@@ -246,7 +258,7 @@ def test_icd10_agreement_true_when_codes_match():
     store = MockRAGStore()
     guard = make_consistency_guard_node(store)
     state = _base_state(
-        cot_result={"severity": "significant", "severity_level": 2,
+        cot_result={"cot_label": "benign", "severity": "significant", "severity_level": 2,
                     "icd10_hint": "N63.0", "risk_category": "BI-RADS 3",
                     "reasoning": "test"},
     )
@@ -269,7 +281,7 @@ def test_qa_agent_node_surfaces_both_icd10_codes_when_disagreement():
     state = _base_state(
         consensus=True,
         icd10_agreement=False,
-        cot_result={"severity": "significant", "severity_level": 2,
+        cot_result={"cot_label": "malignant", "severity": "significant", "severity_level": 2,
                     "icd10_hint": "C50.9", "risk_category": "BI-RADS 5",
                     "reasoning": "test"},
     )
@@ -288,7 +300,7 @@ def test_qa_agent_node_single_icd10_when_codes_agree():
     state = _base_state(
         consensus=True,
         icd10_agreement=True,
-        cot_result={"severity": "significant", "severity_level": 2,
+        cot_result={"cot_label": "benign", "severity": "significant", "severity_level": 2,
                     "icd10_hint": "N63.0", "risk_category": "BI-RADS 3",
                     "reasoning": "test"},
     )
@@ -302,7 +314,7 @@ def test_consistency_guard_consensus_none_when_cot_undetermined():
     store = MockRAGStore()
     guard = make_consistency_guard_node(store)
     state = _base_state(
-        cot_result={"severity": "undetermined", "severity_level": 0,
+        cot_result={"cot_label": "unknown", "severity": "undetermined", "severity_level": 0,
                     "icd10_hint": "R93.8", "risk_category": "undetermined",
                     "reasoning": "parse error"},
     )
@@ -324,7 +336,7 @@ def test_consistency_guard_handles_knowledge_none_without_crashing():
         knowledge=None,
         routing=None,
         model_output=None,
-        cot_result={"severity": "incidental", "severity_level": 1,
+        cot_result={"cot_label": "benign", "severity": "incidental", "severity_level": 1,
                     "icd10_hint": "N63.0", "risk_category": "low", "reasoning": "x"},
     )
     result = asyncio.run(guard(state))

@@ -23,6 +23,11 @@ data/busi/*
 !data/busi/.gitkeep
 data/tn3k/*
 !data/tn3k/.gitkeep
+data/router/*
+!data/router/.gitkeep
+
+eval/results/*
+!eval/results/.gitkeep
 
 # --- Vector Database & RAG ---
 # Bỏ qua cơ sở dữ liệu vector được tạo ra khi chạy chương trình

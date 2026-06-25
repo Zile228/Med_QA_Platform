@@ -36,7 +36,7 @@ _POSTPROCESS_BY_ORGAN = {
 BIRADS_MAP = {
     "normal":    {"birads": "BI-RADS 1", "risk_category": "Negative (BI-RADS 1)"},
     "benign":    {"birads": "BI-RADS 3", "risk_category": "Probably benign (BI-RADS 3)"},
-    "malignant": {"birads": "BI-RADS 4C–5", "risk_category": "High suspicion (BI-RADS 4C–5)"},
+    "malignant": {"birads": "BI-RADS 4C-5", "risk_category": "High suspicion (BI-RADS 4C-5)"},
 }
 
 # Thyroid: maps TI-RADS by label
@@ -80,7 +80,7 @@ DESCRIPTION_MAP = {
     ("breast", "malignant"): (
         "Irregular hypoechoic mass with ill-defined or spiculated margins. "
         "Posterior acoustic shadowing may be present. "
-        "Findings are highly suspicious for malignancy (BI-RADS 4C–5). "
+        "Findings are highly suspicious for malignancy (BI-RADS 4C-5). "
         "Tissue sampling is strongly recommended."
     ),
     ("thyroid", "normal"):   (
@@ -89,7 +89,7 @@ DESCRIPTION_MAP = {
     ("thyroid", "benign"):   (
         "Mildly hypoechoic nodule with smooth margins. "
         "Low to intermediate suspicion per ACR TI-RADS 3. "
-        "Follow-up ultrasound in 1–2 years recommended."
+        "Follow-up ultrasound in 1-2 years recommended."
     ),
     ("thyroid", "malignant"): (
         "Solid hypoechoic nodule with irregular margins, micro-calcifications, or taller-than-wide shape. "
@@ -198,7 +198,8 @@ def derive_spatial(
     mask_png_base64: str,
     original_size: tuple,
     organ: str = "breast",
-    pixel_spacing_mm: float = 0.1,
+    pixel_spacing_mm=None,
+    laterality=None,
 ) -> dict:
     """
     Wraps postprocess_mask from the Vision service.
@@ -210,6 +211,8 @@ def derive_spatial(
         original_size:    (H, W) of the original image
         organ:            'breast' | 'thyroid'
         pixel_spacing_mm: mm/pixel
+        laterality:       'left' | 'right' | None. Used by breast quadrant labeling
+                          to resolve outer/inner; ignored for other organs.
 
     Returns a dict mapping 1-1 into the SpatialDerived schema.
 
@@ -228,4 +231,5 @@ def derive_spatial(
         original_size=tuple(original_size),
         organ=organ_key,
         pixel_spacing_mm=pixel_spacing_mm,
+        laterality=laterality,
     )

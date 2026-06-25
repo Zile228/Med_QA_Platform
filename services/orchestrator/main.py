@@ -75,6 +75,11 @@ try:
         "Distribution of confidence scores from the vision model",
         buckets=[0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 1.0],
     )
+    _cot_parse_failure_counter = Counter(
+        "orchestrator_cot_parse_failure_total",
+        "Number of requests where CoT JSON parsing failed (severity=undetermined). "
+        "High values indicate the LLM is not following the required output schema.",
+    )
 except ImportError:
     PROM_AVAILABLE = False
 
@@ -215,13 +220,17 @@ def metrics():
 @app.post("/analyze", response_model=ReportOutput)
 async def analyze(
     image: UploadFile = File(..., description="Ultrasound image PNG/JPG"),
-    question: str = Form(
-        default="What are the findings in this ultrasound image?",
-        description="Clinical question",
-    ),
     image_id: str = Form(default=None, description="Optional custom image ID"),
     modality_hint: Optional[str] = Form(default=None, description="'breast' | 'thyroid' | None"),
     organ_hint: Optional[str] = Form(default=None, description="'breast' | 'thyroid' | None"),
+    pixel_spacing_mm: Optional[float] = Form(
+        default=None,
+        description="Real-world mm per pixel, typically from DICOM metadata. None when unknown.",
+    ),
+    laterality: Optional[str] = Form(
+        default=None,
+        description="'left' | 'right' | None. Resolves breast outer/inner labeling.",
+    ),
 ):
     """
     Main entry point for the client / Gradio UI.
@@ -230,6 +239,10 @@ async def analyze(
     combines them with router_probs by weight to reach the final decision.
     Hint conflicts are recorded in Tier1Structured.hint_conflict and
     hint_resolution_note.
+
+    pixel_spacing_mm and laterality are forwarded to the spatial node.
+    Without them, area_cm2 stays None and breast outer/inner stays
+    unresolved, exactly as when omitted today.
     """
     if _graph is None:
         raise HTTPException(status_code=503, detail="Orchestrator not ready.")
@@ -250,10 +263,11 @@ async def analyze(
             report_dict = await run_pipeline_async(
                 graph=_graph,
                 image_bytes=image_bytes,
-                question=question,
                 image_id=image_id,
                 modality_hint=modality_hint,
                 organ_hint=organ_hint,
+                pixel_spacing_mm=pixel_spacing_mm,
+                laterality=laterality,
             )
             t1_data = report_dict.get("tier_1_structured", {})
             span.set_attribute("result.organ",      t1_data.get("organ", ""))
@@ -316,6 +330,9 @@ async def analyze(
             cot_result = CoTResult(**cot_raw)
         except Exception:
             cot_result = None
+    elif cot_raw and isinstance(cot_raw, dict) and cot_raw.get("severity") == "undetermined":
+        if PROM_AVAILABLE:
+            _cot_parse_failure_counter.inc()
 
     try:
         tier1_obj = Tier1Structured(**t1)
@@ -337,6 +354,7 @@ async def analyze(
         cot_result=cot_result,
         consensus=report_dict.get("consensus"),
         icd10_agreement=report_dict.get("icd10_agreement"),
+        hard_conflict=report_dict.get("hard_conflict"),
     )
 
 
