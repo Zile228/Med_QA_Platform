@@ -1,14 +1,14 @@
 """
 services/orchestrator/rag/faiss_store.py
-==========================================
 FAISS-based RAG retrieval for clinical documents.
 
 Workflow:
   1. Build (offline):   scripts/build_vectordb.py runs once, indexes PDFs -> disk
   2. Retrieve (online): FAISSStore.retrieve(...) -> List[str]
 
-Metadata (source_file, page_number, organ) is loaded from metadata.pkl if present.
-An old index (without metadata.pkl) still works -- falls back to returning plain chunk text.
+Metadata (source_file, page_number, page_end, section_heading, organ) is
+loaded from metadata.pkl if present. An index without metadata.pkl still
+works, falling back to a "general" placeholder for every chunk.
 
 Public API:
     FAISSStore(index_path, docs_path)
@@ -179,7 +179,9 @@ class FAISSStore:
         Retrieve the top-k chunks with full metadata.
 
         Returns a list of dicts:
-            {"chunk": str, "source_file": str, "page_number": int, "organ": str}
+            {"chunk": str, "source_file": str, "page_number": int,
+             "page_end": int, "section_heading": str | None,
+             "organ": str, "score": float}
         """
         if not self.is_ready():
             return []
@@ -200,12 +202,15 @@ class FAISSStore:
                     continue
                 seen_texts.add(text)
                 meta = self._metadata[idx] if idx < len(self._metadata) else {}
+                page_number = meta.get("page_number", 0)
                 results.append({
-                    "chunk":       text,
-                    "source_file": meta.get("source_file", "unknown"),
-                    "page_number": meta.get("page_number", 0),
-                    "organ":       meta.get("organ", "general"),
-                    "score":       round(dist, 4),
+                    "chunk":           text,
+                    "source_file":     meta.get("source_file", "unknown"),
+                    "page_number":     page_number,
+                    "page_end":        meta.get("page_end", page_number),
+                    "section_heading": meta.get("section_heading"),
+                    "organ":           meta.get("organ", "general"),
+                    "score":           round(dist, 4),
                 })
                 if len(results) >= k:
                     break

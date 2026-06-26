@@ -1,16 +1,10 @@
 #!/bin/sh
 # services/orchestrator/entrypoint.sh
-# =====================================
-# Automatically builds the FAISS index on container start if:
-#   - There is at least 1 PDF in RAG_DOCS_DIR, AND
-#   - The index does not exist OR a PDF is newer than the current index
 #
-# If there is no PDF, or the build itself fails (e.g. a PDF has no
-# extractable text, a dependency is missing), this does NOT block container
-# start -- the orchestrator still runs, it's just that rag_disabled_warning
-# will appear in every report (set in graph.py::make_report_node). A failed
-# build should never be fatal: a broken/empty PDF must not take down the
-# whole service on every restart.
+# Builds the FAISS index on container start if there is at least 1 PDF in
+# RAG_DOCS_DIR and the index is missing or older than a PDF. A failed or
+# skipped build never blocks startup; the orchestrator runs with
+# rag_disabled_warning in every report instead (set in graph.py).
 
 DOCS_DIR="${RAG_DOCS_DIR:-services/orchestrator/rag/docs}"
 OUT_DIR="${RAG_VECTORDB_DIR:-services/orchestrator/rag/vectordb}"
