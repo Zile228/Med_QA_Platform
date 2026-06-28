@@ -125,22 +125,25 @@ def pdf_to_marked_markdown(pdf_path: str) -> str:
     proc = mp.Process(target=_markdown_worker, args=(pdf_path, result_queue))
     start = time.time()
     proc.start()
-    proc.join(timeout=PDF_TIMEOUT_SECONDS)
 
+    try:
+        status, payload = result_queue.get(timeout=PDF_TIMEOUT_SECONDS)
+    except Exception:
+        # Must kill here rather than join first: joining before draining a
+        # full queue can deadlock while the child flushes its result.
+        proc.terminate()
+        proc.join()
+        elapsed = time.time() - start
+        print(f"  [WARN] {os.path.basename(pdf_path)} exceeded "
+              f"{PDF_TIMEOUT_SECONDS / 60:.0f} min timeout after {elapsed:.0f}s -- skipping.")
+        return ""
+
+    proc.join(timeout=30)
     if proc.is_alive():
         proc.terminate()
         proc.join()
-        print(f"  [WARN] {os.path.basename(pdf_path)} exceeded "
-              f"{PDF_TIMEOUT_SECONDS / 60:.0f} min timeout -- skipping.")
-        return ""
 
     elapsed = time.time() - start
-    if result_queue.empty():
-        print(f"  [WARN] {os.path.basename(pdf_path)} produced no result "
-              f"(process likely crashed) after {elapsed:.0f}s -- skipping.")
-        return ""
-
-    status, payload = result_queue.get()
     if status == "error":
         print(f"  [WARN] Could not read {pdf_path}: {payload}")
         return ""
