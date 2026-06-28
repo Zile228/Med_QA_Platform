@@ -4,8 +4,9 @@ services/orchestrator/graph.py
 LangGraph pipeline - orchestrates the entire flow.
 
 Graph topology:
-    route -> vision -> spatial -> knowledge                      --|
-                               -> rag_retrieve -> cot_reasoning  --|-> merge -> consistency_guard -> qa_agent
+    route -> vision -> spatial -> knowledge                              |
+                               -> rag_retrieve         |                  |
+                               -> birads_description   |-> cot_reasoning  |-> merge -> consistency_guard -> qa_agent
 
 Public API:
     build_graph(services_cfg, llm_client, rag_store, registry) -> CompiledGraph
@@ -34,6 +35,7 @@ from shared.schemas import (
 )
 from shared.telemetry import get_tracer
 from services.orchestrator.visual_interpreter import interpret_visual_features
+from services.orchestrator.birads_describer import describe_image as _describe_image
 
 
 def _keep_last(a, b):
@@ -72,6 +74,7 @@ class OrchestratorState(TypedDict):
 
     visual_flags:   Annotated[list, _merge_list]
     risk_modifier:  Annotated[Optional[int], _keep_last]
+    birads_description: Annotated[Optional[dict], _keep_last]
 
     report:         Annotated[Optional[dict], _keep_last]
     error:          Annotated[Optional[str], _keep_last]
@@ -240,7 +243,7 @@ Cumulative risk modifier: {risk_modifier:+d}
 - Location: {sd.get('location_quadrant', 'unknown')}
 - Area: {area_str}
 - Aspect ratio: {sd.get('aspect_ratio', 0):.3f} -- {sd.get('aspect_ratio_interpretation', '')}
-- Circularity: {sd.get('circularity', 0)} (<0.5 = irregular margin / suspicious)
+- Circularity: {sd.get('circularity', 0)}
 - Bounding box: {sd.get('bbox', [])}
 
 ### Clinical Coverage Note
@@ -271,36 +274,103 @@ def _build_cot_prompt(
     visual_features: dict,
     rag_chunks: list,
     organ: str,
+    modality: str = "ultrasound",
+    valid_labels: Optional[list] = None,
+    birads_description: Optional[dict] = None,
 ) -> str:
     """
     Build the Chain-of-Thought prompt without CNN label.
     CoT reasons ONLY from spatial features and clinical guidelines.
     Uncertainty and Grad-CAM overlap flags are disabled -- Step 2 reflects
     spatial-only flags when those metrics are inactive.
+
+    birads_description, when provided, adds a Step 0 with the visual
+    features observed by the vision model (BI-RADS/TI-RADS lexicon).
     """
     rag_text = "\n\n".join(rag_chunks) if rag_chunks else "No clinical guidelines available."
     flags_text = "\n".join(f"  - {f}" for f in visual_features.get("clinical_flags", []))
     if not flags_text:
         flags_text = "  (no significant flags)"
 
+    # location_quadrant == "none" is the sentinel _empty_spatial() returns
+    # when no contour was found in the mask -- a genuine "no lesion detected"
+    # case, not missing measurement data. Reusing area_cm2's None for both
+    # cases used to read as "unavailable (no DICOM metadata)" even here,
+    # which told the model the wrong reason and reliably pushed it away
+    # from ever choosing "normal".
+    no_lesion_detected = spatial.get("location_quadrant") == "none"
+
     area_val = spatial.get("area_cm2")
     area_str = f"{area_val:.3f} cm2" if area_val is not None else "unavailable (no DICOM metadata)"
 
-    # TN3K has only benign/malignant labels; "normal" is not a valid class for thyroid.
-    if organ == "thyroid":
+    if valid_labels:
+        cot_label_options = " | ".join(f'"{l}"' for l in valid_labels)
+    elif organ == "thyroid":
+        # TN3K has only benign/malignant labels; "normal" is not a valid class for thyroid.
         cot_label_options = '"benign" | "malignant"'
     else:
         cot_label_options = '"benign" | "malignant" | "normal"'
 
-    return f"""You are analyzing a {organ} ultrasound image.
-You have NOT been told the CNN model's classification label.
-Reason ONLY from the imaging features and clinical guidelines below.
+    birads_block = ""
+    if birads_description:
+        if organ == "breast":
+            modality_label = "BI-RADS"
+        elif organ == "thyroid":
+            modality_label = "TI-RADS"
+        else:
+            modality_label = "Clinical"
 
-## Step 1: Spatial Features (from segmentation mask)
+        confidence = birads_description.get("observation_confidence", "unknown")
+        confidence_note = (
+            "\n[!] Note: observation confidence is LOW -- treat visual features as uncertain."
+            if confidence == "low" else ""
+        )
+        formatted_fields = "\n".join(
+            f"- {key}: {value}"
+            for key, value in birads_description.items()
+            if key not in ("observation_confidence", "notes")
+        )
+        notes = birads_description.get("notes", "none") or "none"
+
+        birads_block = f"""
+## Step 0: Visual Features (observed by Vision Model -- {modality_label} Lexicon)
+Observation confidence: {confidence}{confidence_note}
+{formatted_fields}
+Additional notes: {notes}
+"""
+
+    step_ref = "Step 0 through Step 4" if birads_block else "Step 1 through Step 4"
+    reasoning_template = (
+        "Step 0: ... Step 1: ... Step 2: ... Step 3: ... Step 4: ..."
+        if birads_block
+        else "Step 1: ... Step 2: ... Step 3: ... Step 4: ..."
+    )
+
+    if no_lesion_detected:
+        spatial_block = """## Step 1: Spatial Features (from segmentation mask)
+No lesion/nodule contour was found in the segmentation mask. This means the
+segmentation model did not detect any focal abnormality in this image --
+treat this as a strong signal toward "normal", not as missing data."""
+    else:
+        spatial_block = f"""## Step 1: Spatial Features (from segmentation mask)
 - Location: {spatial.get('location_quadrant', 'unknown')}
 - Area: {area_str}
 - Aspect ratio: {spatial.get('aspect_ratio', 0):.3f} -- {spatial.get('aspect_ratio_interpretation', '')}
-- Circularity: {spatial.get('circularity', 0):.3f} (< 0.5 = irregular margin, suspicious)
+- Circularity: {spatial.get('circularity', 0):.3f} (< 0.5 = irregular margin, suspicious)"""
+
+    no_lesion_hint = (
+        '\n  IMPORTANT: no lesion contour was found (see Step 1) -- this should be '
+        'classified as "normal" unless the clinical guidelines above state a '
+        "specific reason otherwise."
+        if no_lesion_detected and "normal" in cot_label_options
+        else ""
+    )
+
+    return f"""You are analyzing a {organ} {modality} image.
+You have NOT been told the CNN model's classification label.
+Reason ONLY from the imaging features and clinical guidelines below.
+{birads_block}
+{spatial_block}
 
 ## Step 2: Spatial Flags (from segmentation mask)
 Clinical flags derived from spatial features:
@@ -313,8 +383,8 @@ Risk modifier from flags: {visual_features.get('risk_modifier', 0):+d}
 {rag_text}
 
 ## Step 4: Conclude
-Based ONLY on the above (do not assume any CNN label), determine:
-- cot_label: your independent classification -- {cot_label_options}
+Based on the {step_ref} above (do not assume any CNN label), determine:
+- cot_label: your independent classification -- {cot_label_options}{no_lesion_hint}
 - severity: "incidental" | "significant" | "urgent" | "critical"
 - severity_level: integer 1-4 matching severity
 - icd10_hint: appropriate ICD-10 code for {organ} + your cot_label
@@ -328,7 +398,7 @@ Output ONLY valid JSON, no markdown, no text outside the JSON object:
   "severity_level": 0,
   "icd10_hint": "...",
   "risk_category": "...",
-  "reasoning": "Step 1: ... Step 2: ... Step 3: ... Step 4: ..."
+  "reasoning": "{reasoning_template}"
 }}"""
 
 
@@ -519,6 +589,59 @@ def make_spatial_node(knowledge_url: str, registry=None):
     return spatial_node
 
 
+def make_birads_node(llm_client):
+    """
+    Calls Gemini Vision to describe the lesion/nodule using BI-RADS/TI-RADS
+    lexicon. Runs in parallel with rag_retrieve, after spatial_node.
+
+    Returns birads_description=None when llm_client has no multimodal
+    support or when Gemini Vision fails -- the pipeline continues normally
+    either way.
+    """
+    async def birads_description_node(state: OrchestratorState) -> dict:
+        if state.get("error"):
+            return {"birads_description": None}
+
+        routing  = state.get("routing") or {}
+        modality = routing.get("modality", "ultrasound")
+        organ    = routing.get("organ", "breast")
+
+        image_bytes = state.get("image_bytes")
+        model_output = state.get("model_output") or {}
+        mask_b64 = model_output.get("mask_png_base64", "")
+
+        if not image_bytes:
+            return {"birads_description": None}
+
+        with get_tracer().start_as_current_span("graph.birads_description") as span:
+            span.set_attribute("image_id", state.get("image_id", ""))
+            span.set_attribute("birads.modality", modality)
+            span.set_attribute("birads.organ", organ)
+            span.set_attribute("birads.has_mask", bool(mask_b64))
+            try:
+                from services.orchestrator.birads_describer import _make_mask_overlay
+                input_bytes = await asyncio.to_thread(_make_mask_overlay, image_bytes, mask_b64)
+
+                result = await asyncio.to_thread(
+                    _describe_image,
+                    input_bytes,
+                    llm_client,
+                    modality,
+                    organ,
+                )
+                span.set_attribute(
+                    "birads.confidence",
+                    (result or {}).get("observation_confidence", "none"),
+                )
+                return {"birads_description": result}
+            except Exception as e:
+                span.record_exception(e)
+                print(f"[birads_node] Unexpected error: {e} -- continuing without visual description")
+                return {"birads_description": None}
+
+    return birads_description_node
+
+
 def make_knowledge_node(knowledge_url: str, registry=None):
     """
     registry: ModuleRegistry instance. When provided, uses
@@ -594,6 +717,8 @@ def make_cot_node(llm_client):
             visual_features=visual_features,
             rag_chunks=rag_chunks,
             organ=routing.get("organ", "breast"),
+            modality=routing.get("modality", "ultrasound"),
+            birads_description=state.get("birads_description"),
         )
 
         with get_tracer().start_as_current_span("graph.cot_reasoning") as span:
@@ -704,11 +829,12 @@ def make_second_rag_retrieval(rag_store, rag_mode: str = "two_stage"):
         km = state.get("knowledge") or {}
         routing = state.get("routing") or {}
         organ = routing.get("organ")
+        modality = routing.get("modality", "ultrasound")
         mo = state.get("model_output") or {}
         top_label = mo.get("top_label", "")
         icd10 = km.get("icd10_hint", "")
 
-        enriched_query = f"{top_label} {organ or ''} ultrasound findings {icd10}".strip()
+        enriched_query = f"{top_label} {organ or ''} {modality} findings {icd10}".strip()
 
         if rag_mode == "single_stage":
             try:
@@ -996,6 +1122,7 @@ def build_graph(services_cfg: dict, llm_client, rag_store, registry=None):
     knowledge_node = make_knowledge_node(knowledge_url, registry=registry)
     cot_node = make_cot_node(llm_client)
     rag_node = make_rag_node(rag_store, rag_mode=rag_mode)
+    birads_node = make_birads_node(llm_client)
     merge_node = make_merge_node()
     consistency_guard_node = make_consistency_guard_node(rag_store, rag_mode=rag_mode)
     qa_agent_node = make_qa_agent_node(llm_client, rag_store)
@@ -1008,6 +1135,7 @@ def build_graph(services_cfg: dict, llm_client, rag_store, registry=None):
         g.add_node("knowledge", knowledge_node)
         g.add_node("cot_reasoning", cot_node)
         g.add_node("rag_retrieve", rag_node)
+        g.add_node("birads_description", birads_node)
         g.add_node("merge", merge_node)
         g.add_node("consistency_guard", consistency_guard_node)
         g.add_node("qa_agent", qa_agent_node)
@@ -1017,9 +1145,10 @@ def build_graph(services_cfg: dict, llm_client, rag_store, registry=None):
         g.add_edge("vision", "spatial")
         g.add_edge("spatial", "knowledge")
         g.add_edge("spatial", "rag_retrieve")
-        g.add_edge("rag_retrieve", "cot_reasoning")
+        g.add_edge("spatial", "birads_description")
+        g.add_edge(["rag_retrieve", "birads_description"], "cot_reasoning")
 
-        g.add_edge(["knowledge", "cot_reasoning", "rag_retrieve"], "merge")
+        g.add_edge(["knowledge", "cot_reasoning"], "merge")
         g.add_edge("merge", "consistency_guard")
         g.add_edge("consistency_guard", "qa_agent")
         g.add_edge("qa_agent", END)
@@ -1030,6 +1159,7 @@ def build_graph(services_cfg: dict, llm_client, rag_store, registry=None):
             image_nodes=[route_node, vision_node, spatial_node, knowledge_node],
             cot_node=cot_node,
             rag_node=rag_node,
+            birads_node=birads_node,
             merge_node=merge_node,
             consistency_guard_node=consistency_guard_node,
             qa_agent_node=qa_agent_node,
@@ -1040,12 +1170,13 @@ class AsyncSequentialFallback:
     """
     Fallback when langgraph is not installed.
     Mirrors build_graph edges: route -> vision -> spatial ->
-    {knowledge, rag_retrieve} in parallel -> cot_reasoning -> merge ->
-    consistency_guard -> qa_agent.
+    {knowledge, rag_retrieve, birads_description} in parallel ->
+    cot_reasoning -> merge -> consistency_guard -> qa_agent.
 
-    cot_node runs after rag_retrieve (so its prompt's clinical-guidelines
-    step is populated) but on a snapshot with knowledge set to None, so
-    CoT never sees the CNN-driven mapper result before reasoning.
+    cot_node runs after rag_retrieve and birads_description (so its prompt's
+    clinical-guidelines and visual-features steps are populated) but on a
+    snapshot with knowledge set to None, so CoT never sees the CNN-driven
+    mapper result before reasoning.
     """
 
     def __init__(
@@ -1053,6 +1184,7 @@ class AsyncSequentialFallback:
         image_nodes,
         cot_node,
         rag_node,
+        birads_node,
         merge_node,
         consistency_guard_node,
         qa_agent_node,
@@ -1060,6 +1192,7 @@ class AsyncSequentialFallback:
         self.image_nodes = image_nodes
         self.cot_node = cot_node
         self.rag_node = rag_node
+        self.birads_node = birads_node
         self.merge_node = merge_node
         self.consistency_guard_node = consistency_guard_node
         self.qa_agent_node = qa_agent_node
@@ -1084,13 +1217,16 @@ class AsyncSequentialFallback:
 
         state_for_knowledge = copy.deepcopy(state)
         state_for_rag = copy.deepcopy(state)
-        knowledge_partial, rag_result = await asyncio.gather(
+        state_for_birads = copy.deepcopy(state)
+        knowledge_partial, rag_result, birads_partial = await asyncio.gather(
             knowledge_node(state_for_knowledge),
             self.rag_node(state_for_rag),
+            self.birads_node(state_for_birads),
         )
         state.update(knowledge_partial)
         state["rag_chunks"] = rag_result.get("rag_chunks", [])
         state["rag_meta"] = rag_result.get("rag_meta", [])
+        state["birads_description"] = birads_partial.get("birads_description")
 
         state_for_cot = copy.deepcopy(state)
         state_for_cot["knowledge"] = None
@@ -1152,6 +1288,7 @@ async def run_pipeline_async(
         "hard_conflict": None,
         "visual_flags": [],
         "risk_modifier": 0,
+        "birads_description": None,
         "report": None,
         "error": None,
     }

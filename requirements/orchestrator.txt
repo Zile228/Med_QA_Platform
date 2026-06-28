@@ -2,6 +2,7 @@ fastapi>=0.110.0
 uvicorn[standard]>=0.29.0
 python-multipart>=0.0.9
 httpx>=0.27.0
+python-dotenv>=1.0.0
 langgraph>=0.1.0
 pydantic>=2.6.0
 faiss-cpu>=1.7.4
@@ -12,6 +13,10 @@ pymupdf4llm>=0.0.17
 langchain-text-splitters>=0.2.0
 # Cross-encoder for reranking RAG chunks
 sentence-transformers[cross-encoder]>=2.6.0
+# Used by birads_describer.py to overlay the lesion mask before Gemini Vision
+opencv-python-headless>=4.9.0
+numpy>=1.26.0
+Pillow>=10.2.0
 opentelemetry-sdk>=1.24.0
 opentelemetry-exporter-otlp-proto-grpc>=1.24.0
 opentelemetry-instrumentation-fastapi>=0.45b0

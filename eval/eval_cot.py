@@ -15,7 +15,7 @@ Ket qua:
   3. CoT parse failure rate:
        - Dem so case cot_label == "unknown" hoac severity == "undetermined".
        - Cac metric chinh LOai cac case nay khoi mau so va bao cao rieng.
-  4. Kiem tra bất nhất cot_label="normal" tren thyroid:
+  4. Kiem tra bat nhat cot_label="normal" tren thyroid:
        - Bao cao so luong va ti le case thyroid ma CoT chon "normal" (loi thiet ke prompt).
        - Sau khi fix _build_cot_prompt, van can audit de xac nhan so nay = 0.
   5. Self-consistency (--consistency_runs > 1):
@@ -62,8 +62,12 @@ Cau truc thu muc can thiet (giong eval_vision.py):
         001.png
         ...
       label4test.csv   <- cot "image_name", cot "label" (0=benign, 1=malignant)
-LLM backend duoc chon qua env LLM_BACKEND (ollama | google | mock).
+LLM backend duoc chon qua env LLM_BACKEND (ollama | google | remote | local_hf | mock).
 Neu khong set, mac dinh la ollama. Xem services/orchestrator/llm_client.py.
+De so sanh Gemini vs Qwen fine-tune (truoc/sau khi deploy), chay script nay
+2 lan voi LLM_BACKEND khac nhau (vd LLM_BACKEND=google roi LLM_BACKEND=remote),
+dung cung --busi_dir/--tn3k_dir, --out_dir khac nhau cho moi lan, roi so sanh
+2 file ket qua trong eval/results/.
 Chay:
   python eval/eval_cot.py \\
     --busi_dir           data/busi/test_busi \\
@@ -98,6 +102,13 @@ import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+# Script nay chay standalone (khong qua docker-compose), nen .env KHONG duoc
+# tu doc nhu khi chay trong container (docker-compose doc qua "env_file: .env").
+# Phai tu load o day, neu khong os.getenv("LLM_BACKEND") luon la None va
+# get_llm_client() se mac dinh ve "ollama" du .env co ghi gi.
+from dotenv import load_dotenv
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 try:
     from sklearn.metrics import (
@@ -258,6 +269,7 @@ def _import_modules():
     from services.orchestrator.visual_interpreter import interpret_visual_features
     from services.orchestrator.llm_client import get_llm_client
     from services.orchestrator.graph import _build_cot_prompt, COT_SYSTEM_PROMPT
+    from services.orchestrator.birads_describer import describe_image as _describe_image
     return {
         "load_breast": load_breast,
         "run_breast": run_breast,
@@ -269,6 +281,7 @@ def _import_modules():
         "get_llm_client": get_llm_client,
         "_build_cot_prompt": _build_cot_prompt,
         "COT_SYSTEM_PROMPT": COT_SYSTEM_PROMPT,
+        "describe_image": _describe_image,
     }
 
 
@@ -301,6 +314,7 @@ def collect_busi_dataset(busi_dir: Path) -> list:
                 "mask_bytes": mask_bytes,
                 "image_path": str(p),
                 "organ": "breast",
+                "modality": "ultrasound",
                 "dataset": "busi",
             })
     return samples
@@ -363,6 +377,7 @@ def collect_tn3k_dataset(tn3k_dir: Path) -> list:
             "mask_bytes": mask_bytes,
             "image_path": str(p),
             "organ": "thyroid",
+            "modality": "ultrasound",
             "dataset": "tn3k",
         })
     if n_missing > 0:
@@ -395,6 +410,7 @@ def _run_cot_once(
     cfg,
     fns: dict,
     llm_client,
+    use_birads_vision: bool = False,
 ) -> dict:
     """
     Chay toan bo pipeline CoT mot lan cho 1 sample.
@@ -402,18 +418,21 @@ def _run_cot_once(
       1. run_inference (vision model) -> model_output
       2. derive_spatial (tu mask GT neu co, neu khong tu mask du doan) -> spatial
       3. interpret_visual_features -> visual_features (chi dung spatial flags)
-      4. _build_cot_prompt -> prompt
-      5. llm_client.generate (CoT) -> raw_text -> parse JSON
+      4. (--birads_vision) describe_image -> birads_description, neu duoc bat
+      5. _build_cot_prompt -> prompt
+      6. llm_client.generate (CoT) -> raw_text -> parse JSON
          (llm_client co the la RateLimitedLLMClient, da tu xu ly throttle + retry)
-      6. Tinh label_agreement, consensus, hard_conflict tu code thuc te cua graph.py
+      7. Tinh label_agreement, consensus, hard_conflict tu code thuc te cua graph.py
     Tra ve dict chua:
       cnn_label, cnn_confidence, gt_label, organ,
       cot_label, cot_severity, cot_severity_level, cot_icd10, cot_reasoning,
       mapper_severity_level, mapper_icd10,
       label_agreement, consensus, hard_conflict,
-      cot_parse_failed, image_path, latency_cot_ms
+      cot_parse_failed, image_path, latency_cot_ms,
+      birads_used, birads_confidence
     """
     organ = sample["organ"]
+    modality = sample.get("modality", "ultrasound")
     gt_label = sample["gt_label"]
     image_path = sample["image_path"]
     t_infer_start = time.perf_counter()
@@ -473,7 +492,7 @@ def _run_cot_once(
             "location_confidence": "low",
         }
     km = fns["map_knowledge"](
-        modality="ultrasound",
+        modality=modality,
         organ=organ,
         top_label=cnn_label,
         confidence=cnn_confidence,
@@ -489,11 +508,27 @@ def _run_cot_once(
         spatial=spatial,
         organ=organ,
     )
+
+    birads_description = None
+    if use_birads_vision:
+        try:
+            birads_description = fns["describe_image"](
+                image_bytes=sample["image_bytes"],
+                llm_client=llm_client,
+                modality=modality,
+                organ=organ,
+            )
+        except Exception as e:
+            print(f"  [warn] birads_vision failed ({image_path}): {e} -- proceeding without")
+            birads_description = None
+
     prompt = fns["_build_cot_prompt"](
         spatial=spatial,
         visual_features=visual_features,
         rag_chunks=[],
         organ=organ,
+        modality=modality,
+        birads_description=birads_description,
     )
     t_cot_start = time.perf_counter()
     cot_parse_failed = False
@@ -555,6 +590,8 @@ def _run_cot_once(
         "cot_parse_failed": cot_parse_failed,
         "latency_vision_ms": round(t_infer, 2),
         "latency_cot_ms": round(t_cot, 2),
+        "birads_used": birads_description is not None,
+        "birads_confidence": (birads_description or {}).get("observation_confidence", None),
     }
 
 
@@ -701,6 +738,7 @@ def _compute_self_consistency(
     n_samples: int = 20,
     n_runs: int = 5,
     seed: int = 42,
+    use_birads_vision: bool = False,
 ) -> dict:
     """
     Chon ngau nhien n_samples mau, chay CoT n_runs lan moi mau.
@@ -712,7 +750,10 @@ def _compute_self_consistency(
     for s in chosen:
         runs = []
         for _ in range(n_runs):
-            r = _run_cot_once(s, run_model_fn, model, cfg, fns, llm_client)
+            r = _run_cot_once(
+                s, run_model_fn, model, cfg, fns, llm_client,
+                use_birads_vision=use_birads_vision,
+            )
             runs.append({
                 "cot_label": r.get("cot_label", "unknown"),
                 "cot_severity_level": r.get("cot_severity_level", 0),
@@ -780,6 +821,7 @@ def eval_dataset(
     consistency_n: int,
     out_dir: Optional[Path] = None,
     resume: bool = False,
+    use_birads_vision: bool = False,
 ) -> dict:
     """
     Chay toan bo danh gia Phase 2 cho 1 dataset (BUSI hoac TN3K).
@@ -821,7 +863,10 @@ def eval_dataset(
             continue
 
         print(f"    [{i + 1}/{len(samples)}] {img_name} ... ", end="", flush=True)
-        r = _run_cot_once(s, run_model_fn, model, cfg, fns, llm_client)
+        r = _run_cot_once(
+            s, run_model_fn, model, cfg, fns, llm_client,
+            use_birads_vision=use_birads_vision,
+        )
         if "error" in r:
             print(f"ERROR: {r['error']}", flush=True)
         elif r.get("cot_parse_failed"):
@@ -858,6 +903,7 @@ def eval_dataset(
             n_samples=consistency_n,
             n_runs=consistency_runs,
             seed=seed,
+            use_birads_vision=use_birads_vision,
         )
     valid_records = [r for r in records if "error" not in r]
     cot_latencies = [r["latency_cot_ms"] for r in valid_records]
@@ -990,6 +1036,13 @@ def main():
     parser.add_argument("--resume",        action="store_true",
                         help="Bo qua cac sample da co ket qua trong checkpoint_*.jsonl cu trong out_dir "
                              "(khong goi lai vision model / LLM cho cac sample do).")
+    parser.add_argument(
+        "--birads_vision",
+        action="store_true",
+        default=False,
+        help="Bat Gemini Vision de generate BI-RADS/TI-RADS description truoc CoT. "
+             "Chi hoat dong khi LLM_BACKEND=google va llm_client ho tro generate_with_image.",
+    )
     args = parser.parse_args()
 
     out_dir = Path(args.out_dir)
@@ -1016,6 +1069,12 @@ def main():
         max_retries=args.max_retries,
         retry_base_delay=args.retry_base_delay,
     )
+    if args.birads_vision:
+        print(
+            "[eval_cot] --birads_vision bat: moi sample se ton them 1 Gemini API call rieng "
+            "qua generate_with_image(), KHONG di qua RateLimitedLLMClient throttle. "
+            "Can tinh lai --rate_limit hoac giam toc do chay neu gap rate-limit 429."
+        )
 
     output = {}
 
@@ -1049,6 +1108,7 @@ def main():
                     consistency_n=args.consistency_n,
                     out_dir=out_dir,
                     resume=args.resume,
+                    use_birads_vision=args.birads_vision,
                 )
                 output["busi"] = busi_result
                 print_cot_gt_summary(busi_result, "BUSI (breast, 3-lop)")
@@ -1085,6 +1145,7 @@ def main():
                     consistency_n=args.consistency_n,
                     out_dir=out_dir,
                     resume=args.resume,
+                    use_birads_vision=args.birads_vision,
                 )
                 output["tn3k"] = tn3k_result
                 print_cot_gt_summary(tn3k_result, "TN3K (thyroid, 2-lop)")

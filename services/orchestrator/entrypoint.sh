@@ -1,10 +1,10 @@
 #!/bin/sh
 # services/orchestrator/entrypoint.sh
 #
-# Does not build the FAISS index. Building involves PDF-to-OCR work that
-# competes for CPU with other services starting at the same time, so it
-# must be run separately before `docker compose up`, e.g.:
-#   docker compose run --rm build_vectordb
+# Builds the FAISS index on container start if there is at least 1 PDF in
+# RAG_DOCS_DIR and the index is missing or older than a PDF. A failed or
+# skipped build never blocks startup; the orchestrator runs with
+# rag_disabled_warning in every report instead (set in graph.py).
 
 DOCS_DIR="${RAG_DOCS_DIR:-services/orchestrator/rag/docs}"
 OUT_DIR="${RAG_VECTORDB_DIR:-services/orchestrator/rag/vectordb}"
@@ -12,18 +12,33 @@ INDEX_FILE="${OUT_DIR}/index.faiss"
 
 echo "[entrypoint] Checking RAG index..."
 
-if [ ! -f "$INDEX_FILE" ]; then
-    echo "[entrypoint] WARNING: no index at $INDEX_FILE."
-    echo "[entrypoint] Run 'docker compose run --rm build_vectordb' first, then restart."
-    echo "[entrypoint] Reports will carry rag_disabled_warning until then."
+PDF_COUNT=$(find "$DOCS_DIR" -name "*.pdf" 2>/dev/null | wc -l | tr -d ' ')
+
+if [ "$PDF_COUNT" -eq 0 ]; then
+    echo "[entrypoint] No PDF found in $DOCS_DIR -- skipping RAG index build."
+    echo "[entrypoint] Reports will carry rag_disabled_warning until a PDF is added and the container restarts."
 else
-    PDF_COUNT=$(find "$DOCS_DIR" -name "*.pdf" 2>/dev/null | wc -l | tr -d ' ')
-    NEWEST_PDF=$(find "$DOCS_DIR" -name "*.pdf" -newer "$INDEX_FILE" 2>/dev/null | head -n 1)
-    if [ -n "$NEWEST_PDF" ]; then
-        echo "[entrypoint] WARNING: $NEWEST_PDF is newer than the index."
-        echo "[entrypoint] Run 'docker compose run --rm build_vectordb' to pick up the change."
+    NEED_BUILD=0
+    if [ ! -f "$INDEX_FILE" ]; then
+        NEED_BUILD=1
+        echo "[entrypoint] Index does not exist -- will build."
     else
-        echo "[entrypoint] Index found ($PDF_COUNT PDF(s) tracked) -- using it as is."
+        # Rebuild if a PDF is newer than the current index
+        NEWEST_PDF=$(find "$DOCS_DIR" -name "*.pdf" -newer "$INDEX_FILE" 2>/dev/null | head -n 1)
+        if [ -n "$NEWEST_PDF" ]; then
+            NEED_BUILD=1
+            echo "[entrypoint] Found a PDF newer than the index ($NEWEST_PDF) -- will rebuild."
+        fi
+    fi
+
+    if [ "$NEED_BUILD" -eq 1 ]; then
+        echo "[entrypoint] Building RAG index from $PDF_COUNT PDF(s) in $DOCS_DIR..."
+        if ! python scripts/build_vectordb.py --docs_dir "$DOCS_DIR" --out_dir "$OUT_DIR"; then
+            echo "[entrypoint] WARNING: RAG index build failed -- continuing startup with RAG disabled."
+            echo "[entrypoint] Check the PDF files in $DOCS_DIR and the build_vectordb.py logs above."
+        fi
+    else
+        echo "[entrypoint] Index is already up-to-date -- skipping build."
     fi
 fi
 

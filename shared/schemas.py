@@ -140,6 +140,11 @@ class Tier1Structured(BaseModel):
 class RagSource(BaseModel):
     file: str = Field(...)
     page: int = Field(...)
+    # Optional vi UI khong can hien thi noi dung chunk, chi can citation
+    # (file, page). eval/eval_ragas.py va eval/eval_qa.py dung field nay de
+    # danh gia Faithfulness/Consistency tren noi dung RAG thuc te, vi
+    # _rag_chunks_internal trong graph.py khong duoc serialize ra HTTP response.
+    text: Optional[str] = Field(default=None)
 
 
 class CoTResult(BaseModel):

@@ -30,6 +30,12 @@ import argparse
 import glob
 import multiprocessing as mp
 
+# Use 'spawn' instead of 'fork' to avoid deadlocking with the torch/OpenMP
+# thread pool that SentenceTransformer starts before this module forks a
+# worker process. See:
+# https://docs.python.org/3/library/multiprocessing.html#contexts-and-start-methods
+_MP_SPAWN_CTX = mp.get_context("spawn")
+
 
 PAGE_MARKER_RE = re.compile(r"<!--page:(\d+)-->")
 
@@ -46,7 +52,7 @@ SECONDS_PER_PAGE_ESTIMATE = 1.0
 
 # Hard timeout per PDF. A page that gets the OCR engine stuck must not
 # block the rest of the batch.
-PDF_TIMEOUT_SECONDS = 30 * 60
+PDF_TIMEOUT_SECONDS = 60 * 60
 
 
 def parse_args():
@@ -108,10 +114,10 @@ def pdf_to_marked_markdown(pdf_path: str) -> str:
     inserted before the content of each page so page boundaries can be
     recovered after chunking.
 
-    Runs the conversion in a separate process with a hard timeout, so a
-    single page that hangs the OCR engine cannot block the rest of the
-    batch. Returns an empty string if the PDF cannot be read, times out,
-    or produces no extractable content.
+    Runs the conversion in a separate process (spawn context) with a hard
+    timeout, so a single page that hangs the OCR engine cannot block the
+    rest of the batch. Returns an empty string if the PDF cannot be read,
+    times out, or produces no extractable content.
     """
     page_count = _count_pages(pdf_path)
     if page_count == 0:
@@ -121,16 +127,18 @@ def pdf_to_marked_markdown(pdf_path: str) -> str:
     print(f"    {page_count} pages, estimated time: {eta_seconds / 60:.1f} min "
           f"(hard timeout: {PDF_TIMEOUT_SECONDS / 60:.0f} min)")
 
-    result_queue = mp.Queue()
-    proc = mp.Process(target=_markdown_worker, args=(pdf_path, result_queue))
+    result_queue = _MP_SPAWN_CTX.Queue()
+    proc = _MP_SPAWN_CTX.Process(target=_markdown_worker, args=(pdf_path, result_queue))
     start = time.time()
     proc.start()
 
+    # Get with timeout BEFORE join: if the worker blocks on a full queue
+    # buffer (large result), proc.join() would also block forever waiting
+    # for a process that itself is waiting on result_queue.put() -- a
+    # circular deadlock. Getting first avoids that.
     try:
         status, payload = result_queue.get(timeout=PDF_TIMEOUT_SECONDS)
     except Exception:
-        # Must kill here rather than join first: joining before draining a
-        # full queue can deadlock while the child flushes its result.
         proc.terminate()
         proc.join()
         elapsed = time.time() - start

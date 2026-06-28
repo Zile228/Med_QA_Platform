@@ -312,14 +312,20 @@ async def analyze(
 
     t1 = report_dict["tier_1_structured"]
 
-    # Convert rag_sources from a list of dicts to a list of RagSource
+    # Convert rag_sources from a list of dicts to a list of RagSource.
+    # rag_chunks (text noi dung) va raw_sources (file/page) duoc build tu
+    # cung 1 list reranked trong graph.py (xem rag_chunks = [m["chunk"] for m
+    # in reranked]), nen cung do dai, cung thu tu -- an toan de zip theo index.
     raw_sources = report_dict.get("rag_sources", [])
+    rag_chunks_internal = report_dict.get("_rag_chunks_internal", [])
     rag_sources = []
-    for src in raw_sources:
+    for i, src in enumerate(raw_sources):
         if isinstance(src, dict):
+            chunk_text = rag_chunks_internal[i] if i < len(rag_chunks_internal) else None
             rag_sources.append(RagSource(
                 file=src.get("file", "unknown"),
                 page=src.get("page", 0),
+                text=chunk_text,
             ))
 
     # Convert cot_result from dict to CoTResult if present

@@ -90,17 +90,6 @@ services:
       timeout: 10s
       retries: 3
 
-  build_vectordb:
-    build:
-      context: .
-      dockerfile: services/orchestrator/Dockerfile
-    env_file: .env
-    entrypoint: ["python", "scripts/build_vectordb.py"]
-    volumes:
-      - ./services/orchestrator/rag/docs:/app/services/orchestrator/rag/docs:ro
-      - ./services/orchestrator/rag/vectordb:/app/services/orchestrator/rag/vectordb
-    restart: "no"
-
   orchestrator:
     build:
       context: .
