@@ -8,12 +8,13 @@ pydantic>=2.6.0
 faiss-cpu>=1.7.4
 sentence-transformers>=2.6.0
 google-genai>=0.1.0
+openai>=1.40.0
 PyYAML>=6.0.1
 pymupdf4llm>=0.0.17
 langchain-text-splitters>=0.2.0
 # Cross-encoder for reranking RAG chunks
 sentence-transformers[cross-encoder]>=2.6.0
-# Used by birads_describer.py to overlay the lesion mask before Gemini Vision
+# Used by birads_describer.py to overlay the lesion mask before the vision LLM call
 opencv-python-headless>=4.9.0
 numpy>=1.26.0
 Pillow>=10.2.0

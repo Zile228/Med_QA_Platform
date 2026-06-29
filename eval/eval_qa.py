@@ -36,11 +36,12 @@ NGUON CAU HOI -- hybrid:
   1. FIXED_QUESTIONS: bo cau hoi co dinh, ap dung giong nhau cho moi report
      (on dinh, de tai lap giua cac lan chay). Cau tra loi luon moi vi context
      (report) khac nhau giua cac anh, du cau hoi giong nhau.
-  2. --n_dynamic_questions: Gemini tu sinh them N cau hoi rieng cho tung
+  2. --n_dynamic_questions: judge LLM tu sinh them N cau hoi rieng cho tung
      report cu the (dua vao Tier 1/2/3 cua report do) -- bat duoc cau hoi
      dac thu ma bo co dinh khong luong toi.
 
-RUBRIC G-EVAL -- 5 tieu chi (0-5 diem moi tieu chi, judge la Gemini):
+RUBRIC G-EVAL -- 5 tieu chi (0-5 diem moi tieu chi, judge la LLM duoc cau
+hinh qua get_llm_client(), xem LLM_BACKEND trong .env):
   1. Faithfulness:  reply co bam sat report (Tier 1/2/3) + RAG context da
                      cho khong, hay tu bia them thong tin khong co trong do.
   2. Relevance:      reply co dung trong tam cau hoi duoc hoi khong.
@@ -141,12 +142,10 @@ class RateLimitedLLMClient:
         raise last_exc
 
 
-# ---------------------------------------------------------------------------
-# Sinh cau hoi dong tu Gemini, dua tren report cu the
-# ---------------------------------------------------------------------------
+# Sinh cau hoi dong tu judge LLM, dua tren report cu the
 
 def _generate_dynamic_questions(judge_client, report: dict, n: int) -> list:
-    """Goi Gemini sinh N cau hoi follow-up hop ly dua tren report cu the."""
+    """Goi judge LLM sinh N cau hoi follow-up hop ly dua tren report cu the."""
     t1 = report.get("tier_1_structured", {})
     prompt = f"""Given this medical ultrasound analysis report:
 Classification: {t1.get('label', '?')} (confidence {t1.get('confidence', 0):.0%})

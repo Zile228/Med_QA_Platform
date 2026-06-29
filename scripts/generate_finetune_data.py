@@ -1,7 +1,7 @@
 """
 scripts/generate_finetune_data.py
 ====================================
-Giai doan 2.5b - Sinh synthetic training data cho fine-tune Qwen tu Gemini teacher.
+Giai doan 2.5b - Sinh synthetic training data cho fine-tune Qwen tu Gemini hoac OpenAI teacher.
 
 Dung train split (KHONG dung test split, test split danh rieng cho eval_cot.py):
   data/busi/train_busi/
@@ -17,8 +17,8 @@ Pipeline cho moi sample (dung lai dung cac ham noi bo, giong eval_cot.py):
   1. run_breast / run_thyroid (vision model)          -> model_output
   2. derive_spatial (tu mask GT neu co)                -> spatial
   3. interpret_visual_features                          -> visual_features
-  4. _make_mask_overlay + describe_image (Gemini Vision) -> birads_description
-  5. Goi Gemini text, ep tra ve cot_label = gt_label    -> teacher reasoning JSON
+  4. _make_mask_overlay + describe_image (Vision LLM) -> birads_description
+  5. Goi LLM text, ep tra ve cot_label = gt_label       -> teacher reasoning JSON
   6. Validate JSON parse duoc va cot_label khop gt_label, skip neu khong khop
   7. Ghi ngay 1 dong JSONL (ChatML) ra file, ho tro --resume
 
@@ -37,8 +37,10 @@ Chay:
     [--retry_base_delay 2.0] \\
     [--resume]
 
-LLM_BACKEND phai la "google" -- script can Gemini Vision (BI-RADS/TI-RADS) va
-Gemini text de sinh reasoning chain, khong dung duoc voi backend khac.
+LLM_BACKEND phai la "google" hoac "openai" -- script can mot backend ho tro
+generate_with_image() (BI-RADS/TI-RADS) va generate() text de sinh reasoning
+chain. Cac backend khac (ollama/remote/local_hf/mock) khong ho tro vision nen
+khong dung duoc cho script nay.
 """
 import argparse
 import csv
@@ -52,16 +54,13 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Script nay chay standalone (khong qua docker-compose), nen .env KHONG duoc
-# tu doc nhu khi chay trong container. Phai tu load o day, neu khong
-# os.getenv("LLM_BACKEND")/GOOGLE_API_KEY luon la None/rong du .env co ghi gi.
+# Script nay chay standalone, .env khong tu doc nhu trong container.
+# Phai load o day, neu khong cac bien LLM_BACKEND/API_KEY se rong.
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 
-# ---------------------------------------------------------------------------
 # Rate limiting + retry cho LLM client (giong eval_cot.py)
-# ---------------------------------------------------------------------------
 
 class RateLimitedLLMClient:
     """
@@ -124,16 +123,14 @@ class RateLimitedLLMClient:
         raise last_exc
 
     def generate_with_image(self, *args, **kwargs):
-        """Goi truc tiep, khong rate-limit -- Gemini Vision dung quota rieng."""
+        """Goi truc tiep, khong rate-limit -- API key vision dung quota rieng."""
         return self._inner.generate_with_image(*args, **kwargs)
 
     def __getattr__(self, name):
         return getattr(self._inner, name)
 
 
-# ---------------------------------------------------------------------------
 # Data loaders cho train split (cau truc giong test split trong eval_cot.py)
-# ---------------------------------------------------------------------------
 
 def collect_busi_train(busi_train_dir: Path, max_n: Optional[int] = None) -> list:
     """
@@ -267,9 +264,7 @@ def _empty_spatial(original_size: list) -> dict:
     }
 
 
-# ---------------------------------------------------------------------------
 # Checkpoint / resume
-# ---------------------------------------------------------------------------
 
 def _load_done_paths(out_file: Path) -> set:
     """Doc lai out_file JSONL cu (neu co) -> set cac image_path da xu ly xong."""
@@ -299,9 +294,7 @@ def _append_jsonl(out_file: Path, record: dict):
         f.flush()
 
 
-# ---------------------------------------------------------------------------
 # Sinh 1 training record cho 1 sample
-# ---------------------------------------------------------------------------
 
 def _generate_one_record(
     sample: dict,
@@ -312,7 +305,7 @@ def _generate_one_record(
     llm_client,
 ) -> Optional[dict]:
     """
-    Chay vision + spatial + visual_features + BI-RADS vision + Gemini teacher
+    Chay vision + spatial + visual_features + BI-RADS vision + LLM teacher
     cho 1 sample, tra ve 1 ChatML record hoac None neu validate khong qua.
     """
     organ = sample["organ"]
@@ -479,7 +472,7 @@ def _run_split(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Giai doan 2.5b - Sinh synthetic training data tu Gemini teacher"
+        description="Giai doan 2.5b - Sinh synthetic training data tu Gemini/OpenAI teacher"
     )
     parser.add_argument("--busi_train_dir", default="data/busi/train_busi")
     parser.add_argument("--tn3k_train_dir", default="data/tn3k/train_tn3k")
@@ -507,10 +500,11 @@ def main():
     out_file.parent.mkdir(parents=True, exist_ok=True)
 
     backend = os.getenv("LLM_BACKEND", "ollama").lower()
-    if backend != "google":
+    if backend not in ("google", "openai"):
         print(
             f"[generate_finetune_data] WARNING: LLM_BACKEND='{backend}' nhung script can "
-            "Gemini Vision + Gemini text de sinh teacher data. Dat LLM_BACKEND=google."
+            "mot backend ho tro vision (Gemini Vision hoac OpenAI Vision) de sinh "
+            "BI-RADS/TI-RADS va teacher reasoning. Dat LLM_BACKEND=google hoac LLM_BACKEND=openai."
         )
 
     print("[generate_finetune_data] Import cac module...")

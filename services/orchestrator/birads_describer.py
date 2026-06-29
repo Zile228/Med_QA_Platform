@@ -1,9 +1,10 @@
 """
 services/orchestrator/birads_describer.py
 
-Calls Gemini Vision to describe a lesion/nodule using ACR BI-RADS/TI-RADS
-lexicon. Output is plain observation, not a final diagnosis -- CoT reasoning
-stays independent from this description, it only adds visual context.
+Calls the configured vision-capable LLM (Gemini or OpenAI, via llm_client) to
+describe a lesion/nodule using ACR BI-RADS/TI-RADS lexicon. Output is plain
+observation, not a final diagnosis -- CoT reasoning stays independent from
+this description, it only adds visual context.
 
 Must NOT import from services.knowledge, services.vision, or any other
 service -- only from shared, stdlib, and services.orchestrator.llm_client.
@@ -70,7 +71,7 @@ def _make_mask_overlay(
     color: tuple = (220, 60, 60),
 ) -> bytes:
     """
-    Overlays the lesion mask on the original image so Gemini Vision looks
+    Overlays the lesion mask on the original image so the vision LLM looks
     at the right region. mask_png_base64 comes from ModelOutput.mask_png_base64.
 
     Returns PNG bytes of the overlaid image, or the original image_bytes if
@@ -127,7 +128,7 @@ def describe_image(
     organ: str,
 ) -> Optional[dict]:
     """
-    Returns a BI-RADS/TI-RADS observation dict from Gemini Vision, or None
+    Returns a BI-RADS/TI-RADS observation dict from the vision LLM, or None
     if the client has no multimodal support or the call/parse fails.
 
     Never raises -- caller (graph.py pipeline) must keep running even when

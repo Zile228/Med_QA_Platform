@@ -62,12 +62,12 @@ Cau truc thu muc can thiet (giong eval_vision.py):
         001.png
         ...
       label4test.csv   <- cot "image_name", cot "label" (0=benign, 1=malignant)
-LLM backend duoc chon qua env LLM_BACKEND (ollama | google | remote | local_hf | mock).
+LLM backend duoc chon qua env LLM_BACKEND (ollama | google | openai | remote | local_hf | mock).
 Neu khong set, mac dinh la ollama. Xem services/orchestrator/llm_client.py.
-De so sanh Gemini vs Qwen fine-tune (truoc/sau khi deploy), chay script nay
-2 lan voi LLM_BACKEND khac nhau (vd LLM_BACKEND=google roi LLM_BACKEND=remote),
-dung cung --busi_dir/--tn3k_dir, --out_dir khac nhau cho moi lan, roi so sanh
-2 file ket qua trong eval/results/.
+De so sanh teacher LLM (Gemini/OpenAI) vs Qwen fine-tune (truoc/sau khi deploy),
+chay script nay 2 lan voi LLM_BACKEND khac nhau (vd LLM_BACKEND=openai roi
+LLM_BACKEND=remote), dung cung --busi_dir/--tn3k_dir, --out_dir khac nhau cho
+moi lan, roi so sanh 2 file ket qua trong eval/results/.
 Chay:
   python eval/eval_cot.py \\
     --busi_dir           data/busi/test_busi \\
@@ -1040,8 +1040,8 @@ def main():
         "--birads_vision",
         action="store_true",
         default=False,
-        help="Bat Gemini Vision de generate BI-RADS/TI-RADS description truoc CoT. "
-             "Chi hoat dong khi LLM_BACKEND=google va llm_client ho tro generate_with_image.",
+        help="Bat Vision LLM de generate BI-RADS/TI-RADS description truoc CoT. "
+             "Chi hoat dong khi LLM_BACKEND=google hoac openai va llm_client ho tro generate_with_image.",
     )
     args = parser.parse_args()
 
@@ -1071,7 +1071,7 @@ def main():
     )
     if args.birads_vision:
         print(
-            "[eval_cot] --birads_vision bat: moi sample se ton them 1 Gemini API call rieng "
+            "[eval_cot] --birads_vision bat: moi sample se ton them 1 vision API call rieng "
             "qua generate_with_image(), KHONG di qua RateLimitedLLMClient throttle. "
             "Can tinh lai --rate_limit hoac giam toc do chay neu gap rate-limit 429."
         )

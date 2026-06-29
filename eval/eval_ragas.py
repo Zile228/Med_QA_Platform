@@ -43,6 +43,11 @@ QUAN TRONG -- cac bug da sua so voi ban pseudocode goc:
      chinh thuc cua ragas >=0.2 deu dung EvaluationDataset; HF Dataset chi
      con xuat hien trong tai lieu ban 0.1.x cu.
 
+LLM cham diem RAGAS (Gemini hoac OpenAI) duoc chon qua env RAGAS_LLM_BACKEND
+(mac dinh: theo LLM_BACKEND, fallback "google" neu ca hai khong set). Bien nay
+doc lap voi LLM_BACKEND cua pipeline chinh -- vi du pipeline dung ollama nhung
+van co the cham RAGAS bang Gemini/OpenAI qua RAGAS_LLM_BACKEND rieng.
+
 Chay (khong can ground truth):
   python eval/eval_ragas.py \\
     --mode pipeline \\
@@ -65,9 +70,8 @@ import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-# Script nay chay standalone (khong qua docker-compose), nen .env KHONG duoc
-# tu doc nhu khi chay trong container. Phai tu load o day, neu khong
-# os.environ["GOOGLE_API_KEY"] se raise KeyError du .env co ghi gi.
+# Script nay chay standalone, .env khong tu doc nhu trong container.
+# Phai load o day, neu khong cac bien GOOGLE_API_KEY/OPENAI_API_KEY se rong.
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
@@ -84,19 +88,37 @@ def _get_ground_truth(item: dict) -> str:
 
 def _get_ragas_llm_embeddings():
     """
-    Khoi tao Gemini llm/embeddings cho RAGAS -- ragas mac dinh dung OpenAI,
-    phai override sang Gemini.
+    Khoi tao llm/embeddings cho RAGAS -- ragas mac dinh dung OpenAI, Gemini va
+    OpenAI o day deu phai override qua LangchainLLMWrapper.
+
+    Chon nha cung cap qua RAGAS_LLM_BACKEND (mac dinh: theo LLM_BACKEND, fallback
+    "google" neu ca hai khong set, de khong doi hanh vi mac dinh truoc day).
     """
-    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
     from ragas.llms import LangchainLLMWrapper
+
+    backend = (os.getenv("RAGAS_LLM_BACKEND") or os.getenv("LLM_BACKEND") or "google").lower()
+
+    if backend == "openai":
+        from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+
+        openai_api_key = os.environ["OPENAI_API_KEY"]
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        ragas_llm = LangchainLLMWrapper(
+            ChatOpenAI(model=openai_model, api_key=openai_api_key)
+        )
+        ragas_embeddings = OpenAIEmbeddings(
+            model="text-embedding-3-small", api_key=openai_api_key
+        )
+        return ragas_llm, ragas_embeddings
+
+    from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 
     google_api_key = os.environ["GOOGLE_API_KEY"]
     ragas_llm = LangchainLLMWrapper(
         ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=google_api_key)
     )
-    # gemini-embedding-001: embedding-001 bi deprecated 14/8/2025, va
-    # text-embedding-004 bi deprecated 14/1/2026 -- ca 2 deu khong con
-    # goi duoc. gemini-embedding-001 la model hien hanh (3072 dims).
+    # gemini-embedding-001: embedding-001 va text-embedding-004 da deprecated,
+    # day la model embedding hien hanh cua Gemini (3072 dims).
     ragas_embeddings = GoogleGenerativeAIEmbeddings(
         model="models/gemini-embedding-001", google_api_key=google_api_key
     )

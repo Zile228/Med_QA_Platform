@@ -591,11 +591,11 @@ def make_spatial_node(knowledge_url: str, registry=None):
 
 def make_birads_node(llm_client):
     """
-    Calls Gemini Vision to describe the lesion/nodule using BI-RADS/TI-RADS
-    lexicon. Runs in parallel with rag_retrieve, after spatial_node.
+    Calls the configured vision LLM to describe the lesion/nodule using
+    BI-RADS/TI-RADS lexicon. Runs in parallel with rag_retrieve, after spatial_node.
 
     Returns birads_description=None when llm_client has no multimodal
-    support or when Gemini Vision fails -- the pipeline continues normally
+    support or when the vision call fails -- the pipeline continues normally
     either way.
     """
     async def birads_description_node(state: OrchestratorState) -> dict:

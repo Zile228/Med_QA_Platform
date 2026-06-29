@@ -408,10 +408,14 @@ def test_sequential_fallback_runs_both_rag_and_image_branches():
         def generate(self, prompt, system=None):
             return "TIER 2 findings\nTIER 3 suggestion"
 
+    async def fake_birads(state):
+        return {"birads_description": None}
+
     fb = AsyncSequentialFallback(
         image_nodes=[fake_route, fake_vision, fake_spatial, fake_knowledge],
         cot_node=make_rag_node(rag_store),      # stub the CoT branch with rag_node for simplicity
         rag_node=make_rag_node(rag_store),
+        birads_node=fake_birads,
         merge_node=make_merge_node(),
         consistency_guard_node=make_consistency_guard_node(rag_store),
         qa_agent_node=make_qa_agent_node(MockLLM(), rag_store),
@@ -466,10 +470,14 @@ def test_sequential_fallback_cot_does_not_see_knowledge_before_reasoning():
         def generate(self, prompt, system=None):
             return "TIER 2 findings\nTIER 3 suggestion"
 
+    async def fake_birads(state):
+        return {"birads_description": None}
+
     fb = AsyncSequentialFallback(
         image_nodes=[fake_route, fake_vision, fake_spatial, fake_knowledge],
         cot_node=fake_cot,
         rag_node=make_rag_node(rag_store),
+        birads_node=fake_birads,
         merge_node=make_merge_node(),
         consistency_guard_node=make_consistency_guard_node(rag_store),
         qa_agent_node=make_qa_agent_node(MockLLM(), rag_store),
@@ -502,11 +510,15 @@ def test_sequential_fallback_propagates_error_and_skips_llm():
             called["qa"] = True
             return ""
 
+    async def fake_birads(state):
+        return {"birads_description": None}
+
     rag_store = MockRAGStore()
     fb = AsyncSequentialFallback(
         image_nodes=[fail_route],
         cot_node=make_rag_node(rag_store),
         rag_node=make_rag_node(rag_store),
+        birads_node=fake_birads,
         merge_node=make_merge_node(),
         consistency_guard_node=make_consistency_guard_node(rag_store),
         qa_agent_node=make_qa_agent_node(MockLLM(), rag_store),

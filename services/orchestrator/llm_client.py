@@ -1,11 +1,11 @@
 """
 services/orchestrator/llm_client.py
 =====================================
-LLM client -- supports 5 backends: Ollama (local), Google Gemini (cloud),
-RemoteInferenceClient (fine-tuned model on a rented pod), LocalHFClient
-(fine-tuned model running locally, eval only), and Mock (dev/test).
+LLM client -- supports 6 backends: Ollama (local), Google Gemini (cloud),
+OpenAI (cloud), RemoteInferenceClient (fine-tuned model on a rented pod),
+LocalHFClient (fine-tuned model running locally, eval only), and Mock (dev/test).
 
-Backend is chosen via env LLM_BACKEND='ollama' | 'google' | 'remote' | 'local_hf' | 'mock'.
+Backend is chosen via env LLM_BACKEND='ollama' | 'google' | 'openai' | 'remote' | 'local_hf' | 'mock'.
 Swap backend = change 1 env var, no code changes needed.
 
 Public API:
@@ -23,9 +23,8 @@ from typing import Optional, List
 # Base class for LLM clients
 
 class BaseLLMClient(ABC):
-    # Set to True by subclasses that implement generate_with_image() for
-    # real. hasattr() cannot be used for this check since the default
-    # generate_with_image() below is defined on every subclass.
+    # Set True by subclasses with a real generate_with_image(). hasattr()
+    # cannot be used since the default method exists on every subclass.
     _supports_multimodal: bool = False
 
     @abstractmethod
@@ -219,6 +218,100 @@ class GoogleGeminiClient(BaseLLMClient):
             )
 
 
+# Client for OpenAI
+
+class OpenAIClient(BaseLLMClient):
+    """
+    Calls the OpenAI Chat Completions API via the 'openai' SDK.
+    Requires OPENAI_API_KEY in env.
+    Default model: gpt-4o-mini (supports vision, usable for both CoT text and
+    BI-RADS/TI-RADS image description).
+    """
+
+    _supports_multimodal = True
+
+    def __init__(
+        self,
+        api_key: str = None,
+        model: str = None,
+    ):
+        try:
+            from openai import OpenAI
+        except ImportError:
+            raise ImportError("openai is not installed. Run: pip install openai")
+
+        self.api_key = api_key or os.getenv("OPENAI_API_KEY", "")
+        if not self.api_key:
+            raise ValueError("OPENAI_API_KEY not found in env.")
+
+        self.model_name = model or os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        self._client = OpenAI(api_key=self.api_key)
+        print(f"[llm] OpenAIClient -> model: {self.model_name}")
+
+    def generate(self, prompt: str, system: Optional[str] = None) -> str:
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({"role": "user", "content": prompt})
+        try:
+            resp = self._client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            raise RuntimeError(f"[OpenAIClient] Generate failed: {e}")
+
+    def chat(
+        self,
+        messages: List[dict],
+        system: Optional[str] = None,
+    ) -> str:
+        full_messages = list(messages)
+        if system:
+            full_messages = [{"role": "system", "content": system}] + full_messages
+        try:
+            resp = self._client.chat.completions.create(
+                model=self.model_name,
+                messages=full_messages,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            raise RuntimeError(f"[OpenAIClient] Chat failed: {e}")
+
+    def generate_with_image(
+        self,
+        image_bytes: bytes,
+        prompt: str,
+        system: Optional[str] = None,
+        mime_type: str = "image/png",
+    ) -> str:
+        import base64
+
+        b64_image = base64.b64encode(image_bytes).decode("ascii")
+        messages = []
+        if system:
+            messages.append({"role": "system", "content": system})
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": prompt},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{b64_image}"},
+                },
+            ],
+        })
+        try:
+            resp = self._client.chat.completions.create(
+                model=self.model_name,
+                messages=messages,
+            )
+            return resp.choices[0].message.content.strip()
+        except Exception as e:
+            raise RuntimeError(f"[OpenAIClient] generate_with_image failed: {e}")
+
+
 # Client for a fine-tuned model deployed on a rented pod (RunPod, Vast.ai, Modal...)
 
 class RemoteInferenceClient(BaseLLMClient):
@@ -402,6 +495,7 @@ def get_llm_client() -> BaseLLMClient:
 
     ollama   -> OllamaClient (default)
     google   -> GoogleGeminiClient
+    openai   -> OpenAIClient
     remote   -> RemoteInferenceClient (fine-tuned model on a rented pod)
     local_hf -> LocalHFClient (fine-tuned model running locally, eval only)
     mock     -> MockLLMClient
@@ -412,6 +506,8 @@ def get_llm_client() -> BaseLLMClient:
         return OllamaClient()
     elif backend == "google":
         return GoogleGeminiClient()
+    elif backend == "openai":
+        return OpenAIClient()
     elif backend == "remote":
         return RemoteInferenceClient()
     elif backend == "local_hf":
