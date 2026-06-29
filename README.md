@@ -1,82 +1,99 @@
 ```
-Ảnh Siêu Âm
-                                       │
-                                       ▼
-    ┌──────────────────┐
-    │ [Router Service] │ ◄─── Chạy EfficientNet-B0
-    │ "đây là ảnh gì?" │ ────► Phân loại: us_breast / us_thyroid / ood (hủy bỏ)
-    └──────────────────┘
-                                       │
-                                       ▼
-  ┌──────────────────┐
-  │ [Vision Service] │ ◄─── UNet_MTL (EfficientNet-B4 encoder)
-  │                  │   ├─► Segmentation mask ◄── decoder branch
-  │                  │   ├─► Classification label ◄── cls_head từ bottleneck
-  │                  │   ├─► Spatial features ◄── tính aspect ratio, circularity từ mask
-  │                  │   │
-  │                  │   │   [Đã tạm tắt để hiệu chuẩn thêm]:
-  │                  │   ├─► Bottleneck features (raw 448x7x7)
-  │                  │   ├─► Grad-CAM heatmap (XAI)
-  │                  │   ├─► Texture features (so sánh trong/ngoài mask)
-  │                  │   └─► Uncertainty (MC-Dropout)
-  └──────────────────┘
-                                       │
-                     ┌─────────────────┴─────────────────┐
-                     ▼                                   ▼
-    ┌─────────────────────────────────┐ ┌─────────────────────────────────┐
-    │        [Knowledge Node]         │ │        [RAG Giai Đoạn 1]        │
-    │   Lấy thông tin đo đạc ảnh học  │ │   Tìm kiếm sơ bộ trên vector DB │
-    │   từ nhánh [Vision Service]     │ │   theo từ khóa "Modality + Organ"  │
-    └────────────────┬────────────────┘ └────────────────┬────────────────┘
-                     │                                   │
-                     │                                   ▼
-                     │                  ┌─────────────────────────────────┐
-                     │                  │      [CoT Reasoning Node]       │
-                     │                  │   LLM độc lập suy luận chỉ từ   │
-                     │                  │   thông số hình học & RAG GĐ 1  │
-                     │                  │   (Tuyệt đối giấu nhãn của CNN) │
-                     │                  └────────────────┬────────────────┘
-                     │                                   │
-                     └─────────────────┬─────────────────┘
-                                       ▼
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │                         [Consistency Guard]                         │
-    │   - Thực hiện RAG Giai Đoạn 2 (Rerank lấy top 3 chunks tối ưu nhất) │
-    │   - So khớp kết quả của [CNN + Rule] vs [CoT LLM]                   │
-    │   - Kiểm tra: consensus, label_agreement, hard_conflict            │
-    └──────────────────────────────────┬──────────────────────────────────┘
-                                       │
-                                       ▼
-    ┌─────────────────────────────────────────────────────────────────────┐
-    │                           [QA Agent (LLM)]                          │
-    │   Tổng hợp dữ liệu thành báo cáo 3 tầng (Tier 1, 2, 3)              │
-    │   * Đưa ra cảnh báo đỏ nghiêm trọng nếu phát hiện "Hard Conflict"   │
-    └─────────────────────────────────────────────────────────────────────┘
+                          ┌─────────────────────────────────────────────┐
+                          │                   UI (Gradio)                │
+                          │              ui/app.py — port 7860           │
+                          └───────────────────┬───────────────────────────┘
+                                              │ HTTP (httpx)
+                                   POST /analyze, POST /chat
+                                              ▼
+   ┌───────────────────────────────────────────────────────────────────────────┐
+   │                  ORCHESTRATOR (Layer 4) — port 8000                       │
+   │                  services/orchestrator/main.py + graph.py                 │
+   │   - Đọc module_registry.yaml để biết URL/endpoint từng service           │
+   │   - Build LangGraph 1 lần ở lifespan(), giữ singleton _graph              │
+   │   - /analyze: chạy toàn bộ pipeline (xem mục 2)                          │
+   │   - /chat: dùng lại context đã cache theo image_id (KHÔNG gọi lại        │
+   │     router/vision/knowledge, chỉ gọi LLM)                                │
+   └──────────┬───────────────────┬───────────────────┬────────────────────────┘
+              │ POST /route       │ POST /analyze/...  │ POST /map/spatial
+              │                   │                     │ POST /map/knowledge
+              ▼                   ▼                     ▼
+   ┌─────────────────┐  ┌──────────────────────┐  ┌──────────────────────┐
+   │ ROUTER (L1)      │  │ VISION (L2)           │  │ KNOWLEDGE (L3)        │
+   │ port 8001        │  │ port 8002             │  │ port 8003             │
+   │ EfficientNet-B0   │  │ UNet_MTL              │  │ Rule-based:           │
+   │ modality classify │  │ EfficientNet-B4       │  │ - mapper.py           │
+   │ + OOD detection    │  │ encoder + UNet decoder│  │ - postprocess (gọi    │
+   │                   │  │ seg + classify (3 lớp)│  │   lại code của Vision)│
+   └─────────────────┘  └──────────────────────┘  └──────────────────────┘
+              (Không có ML — chỉ thuần rule + hardcoded clinical knowledge)
 
-[BẮT ĐẦU TRUY VẤN RAG]
-                                  │
-                                  ▼
-┌───────────────────────────────────────────────────────────────────┐
-│ GIAI ĐOẠN 1 (Sau khi xác định được bộ phận siêu âm)     │
-│                                                                   │
-│ - Query: "{modality} {organ}" (VD: "ultrasound breast")            │
-│ - Thực hiện: Quét toàn bộ vector DB (FAISS Store) lọc theo Organ. │
-│ - Kết quả: Lấy ra TOP 100 CHUNKS thô đưa vào State.               │
-└─────────────────────────────────┬─────────────────────────────────┘
-                                  │
-                                  ▼
-┌───────────────────────────────────────────────────────────────────┐
-│ GIAI ĐOẠN 2 (Sau khi có nhãn CNN và mã ICD-10 của Rule) │
-│                                                                   │
-│ - Enriched Query: "{top_label} {organ} ultrasound findings {icd10}"│
-│   (VD: "malignant breast ultrasound findings C50.9")              │
-│                                                                   │
-│ - Thực hiện:                                                      │
-│   1. Tìm thêm TOP 5 CHUNKS mới nhất từ DB bằng Enriched Query.    │
-│   2. Gộp 5 chunks mới này với 100 chunks thô ở Giai đoạn 1.       │
-│   3. Loại bỏ các chunk trùng lặp nội dung.                        │
-│   4. Chạy mô hình Reranker để tái xếp hạng dựa trên Enriched Query│
-│                                                                   │
-│ - Kết quả: Chọn ra TOP 3 CHUNKS xuất sắc nhất nạp vào QA Agent.  │
-└───────────────────────────────────────────────────────────────────┘
+   Orchestrator còn gọi trực tiếp (in-process, không qua HTTP):
+     - llm_client.py        -> LLM (Ollama / Gemini / OpenAI / Remote vLLM / Local HF / Mock)
+     - rag/faiss_store.py    -> FAISS vector store (RAG)
+     - birads_describer.py   -> LLM vision (BI-RADS/TI-RADS observation)
+     - visual_interpreter.py -> dịch numeric feature -> clinical flag (text)
+```
+```
+                         route
+                           │
+                           ▼
+                         vision
+                           │
+                           ▼
+                         spatial
+              ┌────────────┼────────────┐
+              ▼            ▼            ▼
+          knowledge   rag_retrieve  birads_description
+              │            └─────┬──────┘
+              │                  ▼
+              │            cot_reasoning
+              └────────┬─────────┘
+                       ▼
+                     merge
+                       │
+                       ▼
+              consistency_guard      (chạy RAG lần 2 — "second retrieve")
+                       │
+                       ▼
+                    qa_agent          (gọi LLM sinh Tier 2 + Tier 3)
+                       │
+                       ▼
+                      END
+```
+```
+        CNN classify ──► Knowledge mapper ──► severity_level (mapper)
+                                                      │
+                                                      ▼  so sánh
+        Spatial + RAG + (BI-RADS) ──► CoT LLM ──► severity_level (CoT)
+                                                      │
+                                          consensus / icd10_agreement /
+                                          label_agreement / hard_conflict
+```
+```
+Giai đoạn 1 (offline, không cần Docker/LLM)
+  1a. eval_router.py   — Router CNN (modality + OOD)
+  1b. eval_vision.py   — Vision CNN (segmentation + classification)
+        │
+        ▼
+Giai đoạn 2 (offline, cần LLM API key)
+  eval_cot.py với LLM_BACKEND=google/openai  — CoT baseline
+        │
+        ├──► Giai đoạn 2.5 (tuỳ chọn — fine-tune Qwen làm LLM rẻ hơn)
+        │      2.5a. generate_finetune_data.py  (Gemini/OpenAI làm "teacher")
+        │      2.5b. eval_cot.py với Qwen BASE (LLM_BACKEND=remote, trước train) — baseline so sánh
+        │      2.5c. finetune_cot_colab.ipynb   (LoRA fine-tune trên Colab/Kaggle)
+        │      2.5d. eval_cot.py với Qwen FINE-TUNED (sau train, trên cùng test set)
+        │      2.5e. So sánh 3 cột: Gemini / Qwen-base / Qwen-finetuned
+        │
+        ▼
+Giai đoạn 3 (độc lập với 2/2.5 — có thể chạy song song)
+  3a. build_vectordb.py            — build FAISS index từ PDF
+  3b. generate_ragas_testset.py    — sinh testset Q&A tự động từ tài liệu
+  3c. eval_rag.py + eval_ragas.py (--mode retrieval)  — đánh giá retrieval thuần
+  3d. run_pipeline_batch.py + eval_ragas.py (--mode pipeline)  — đánh giá faithfulness trên full pipeline (cần Docker)
+        │
+        ▼
+Giai đoạn 4 (cần Docker, ngay sau 3d trong cùng phiên — TTL cache)
+  run_pipeline_batch.py + eval_qa.py   — đánh giá /chat (chatbot) bằng G-Eval
 ```
