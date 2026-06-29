@@ -6,6 +6,9 @@ Moi buoc ghi ro: script nao, can gi truoc, lenh chay, va output nam o dau.
 Quy uoc chung: tat ca lenh chay tu thu muc root cua repo (`Med_QA_Platform/`),
 khong phai tu trong `eval/`.
 
+> **Windows (PowerShell):** Thay ky tu `\` cuoi dong bang `` ` `` (backtick).
+> Hoac viet toan bo lenh tren 1 dong, bo het cac `\` va xuong dong.
+
 ```
 Tong quan thu tu:
 

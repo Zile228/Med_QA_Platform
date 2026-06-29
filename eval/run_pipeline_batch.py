@@ -21,6 +21,9 @@ Ho tro 2 nguon anh:
                 da export ra .png/.jpg). Neu co file label di kem
                 (--labels_csv: cot 0 = ten file, cot 1 = gt_label) thi gt_label
                 duoc luu kem vao JSON output de doi chieu sau.
+                File co ten ket thuc bang "_mask" (vi du "benign (1)_mask.png")
+                duoc bo qua tu dong -- day la segmentation mask cua BUSI, khong
+                phai anh sieu am, router se reject chung la OOD.
   --organ_hint / --modality_hint  forward thang vao /analyze ('breast' |
                 'thyroid' | None), dat cung 1 gia tri cho ca batch (vd toan
                 bo anh trong thu muc la "breast"). Neu can mix nhieu organ
@@ -86,6 +89,7 @@ def run_batch(
     images = sorted(
         p for p in image_dir_p.iterdir()
         if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".bmp"}
+        and not p.stem.endswith("_mask")
     )
     if max_n:
         images = images[:max_n]

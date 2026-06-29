@@ -102,7 +102,7 @@ def _get_ragas_llm_embeddings():
         from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 
         openai_api_key = os.environ["OPENAI_API_KEY"]
-        openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+        openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
         ragas_llm = LangchainLLMWrapper(
             ChatOpenAI(model=openai_model, api_key=openai_api_key)
         )
@@ -115,7 +115,7 @@ def _get_ragas_llm_embeddings():
 
     google_api_key = os.environ["GOOGLE_API_KEY"]
     ragas_llm = LangchainLLMWrapper(
-        ChatGoogleGenerativeAI(model="gemini-2.5-flash", google_api_key=google_api_key)
+        ChatGoogleGenerativeAI(model="gemini-3.1-flash-lite", google_api_key=google_api_key)
     )
     # gemini-embedding-001: embedding-001 va text-embedding-004 da deprecated,
     # day la model embedding hien hanh cua Gemini (3072 dims).
@@ -145,12 +145,13 @@ def load_pipeline_outputs(pipeline_dir: str) -> list:
         report = data.get("report", {})
         tier2 = report.get("tier_2_radiological_description", "") or ""
         tier3 = report.get("tier_3_diagnostic_suggestion", "") or ""
-        chunks = report.get("_rag_chunks_internal", []) or []
+        rag_sources_raw = report.get("rag_sources", []) or []
+        chunks = [s.get("text") for s in rag_sources_raw if isinstance(s, dict) and s.get("text")]
         image_id = report.get("image_id", fp.stem)
 
         if not chunks:
             print(
-                f"  [warn] {fp.name}: _rag_chunks_internal rong "
+                f"  [warn] {fp.name}: rag_sources[].text rong "
                 f"(rag_disabled_warning={report.get('rag_disabled_warning')!r}). "
                 "Faithfulness se khong co context de doi chieu."
             )

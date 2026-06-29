@@ -392,6 +392,42 @@ def main(docs_dir: str, out_file: str, n_samples: int, rpm: int,
     testset = generator.generate_with_chunks(chunks, testset_size=n_samples)
 
     df = testset.to_pandas()
+
+    # RAGAS to_pandas() / to_list() chi serialize SingleTurnSample.model_dump() +
+    # synthesizer_name -- khong co metadata/source/organ cua Document goc.
+    # Map nguoc: xay dict chunk_text -> organ tu danh sach chunks da co (moi
+    # chunk.metadata["organ"] duoc set truoc khi dua vao RAGAS). Moi sample trong
+    # testset co "reference_contexts" la list van ban chunk goc RAGAS chon lam
+    # nguon -- lay organ cua chunk dau tien tra ve, fallback "general" neu rong.
+    if "organ" not in df.columns:
+        chunk_organ: dict = {
+            doc.page_content: doc.metadata.get("organ", "general")
+            for doc in chunks
+        }
+
+        def _organ_from_ref_contexts(ref_ctxs) -> str:
+            if not isinstance(ref_ctxs, list):
+                return "general"
+            for ctx in ref_ctxs:
+                if isinstance(ctx, str) and ctx in chunk_organ:
+                    return chunk_organ[ctx]
+            # Fallback: partial match 120 ky tu dau de xu ly RAGAS trim text
+            for ctx in ref_ctxs:
+                if not isinstance(ctx, str):
+                    continue
+                prefix = ctx[:120]
+                for chunk_text, organ in chunk_organ.items():
+                    if chunk_text.startswith(prefix) or prefix in chunk_text:
+                        return organ
+            return "general"
+
+        ref_col = df["reference_contexts"] if "reference_contexts" in df.columns else None
+        df["organ"] = (ref_col if ref_col is not None else [None] * len(df)).apply(
+            _organ_from_ref_contexts
+        )
+    if "modality" not in df.columns:
+        df["modality"] = "ultrasound"
+
     Path(out_file).parent.mkdir(parents=True, exist_ok=True)
     df.to_json(out_file, orient="records", force_ascii=False, indent=2)
     print(f"Generated {len(df)} QA pairs -> {out_file}")

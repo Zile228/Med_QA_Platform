@@ -212,7 +212,8 @@ def run_production_query_eval(store, testset: list, top1: int, top2: int, thresh
     return _aggregate(per_query)
 
 
-def run_natural_question_eval(store, testset: list, top1: int, top2: int, threshold: float) -> dict:
+def run_natural_question_eval(store, testset: list, top1: int, top2: int, threshold: float,
+                              skip_rerank: bool = False) -> dict:
     """
     Eval theo cau hoi tu nhien trong testset, KHONG phai cach production goi RAG.
     Chi cho biet retriever lam gi voi 1 cau hoi tu do, tham khao, khong thay
@@ -229,7 +230,10 @@ def run_natural_question_eval(store, testset: list, top1: int, top2: int, thresh
 
         organ = item.get("organ")
         stage1_results = store.retrieve_with_meta(question, k=top1, organ_filter=organ)
-        stage2_results = store.rerank(question, stage1_results, top_n=top2)
+        if skip_rerank:
+            stage2_results = stage1_results[:top2]
+        else:
+            stage2_results = store.rerank(question, stage1_results, top_n=top2)
         per_query.append(_score_pair(stage1_results, stage2_results, ground_truth, threshold))
 
     if n_skipped:
@@ -239,6 +243,7 @@ def run_natural_question_eval(store, testset: list, top1: int, top2: int, thresh
 
 def run_rag_eval(
     testset_file: str, out_file: str, top1: int, top2: int, mode: str, threshold: float,
+    skip_rerank: bool = False,
 ):
     from services.orchestrator.rag.faiss_store import FAISSStore
 
@@ -261,7 +266,7 @@ def run_rag_eval(
             results["production_query"] = prod
 
     if mode in ("natural_question", "both"):
-        nat = run_natural_question_eval(store, testset, top1, top2, threshold)
+        nat = run_natural_question_eval(store, testset, top1, top2, threshold, skip_rerank=skip_rerank)
         if nat is None:
             print("[eval_rag] natural_question: 0 sample hop le.")
         else:
@@ -280,7 +285,16 @@ if __name__ == "__main__":
     p = argparse.ArgumentParser(description="Giai doan 3b - RAG retrieval eval")
     p.add_argument("--testset_file", default="eval/results/ragas_testset.json")
     p.add_argument("--out_file", default="eval/results/rag_retrieval.json")
-    p.add_argument("--top_stage1", type=int, default=100)
+    p.add_argument(
+        "--top_stage1",
+        type=int,
+        default=100,
+        help=(
+            "So chunk lay o Stage 1. Mac dinh 100 (dung cho production_query). "
+            "Voi natural_question tren CPU, nen dat --top_stage1 20 hoac them --skip_rerank "
+            "de tranh rerank 4800 pairs (48 queries x 100 chunks) tren CPU."
+        ),
+    )
     p.add_argument("--top_stage2", type=int, default=3)
     p.add_argument(
         "--mode", choices=["production_query", "natural_question", "both"], default="both",
@@ -289,8 +303,18 @@ if __name__ == "__main__":
         "--relevance_threshold", type=float, default=0.15,
         help="Jaccard token overlap toi thieu de tinh 1 chunk la relevant voi ground_truth.",
     )
+    p.add_argument(
+        "--skip_rerank",
+        action="store_true",
+        default=False,
+        help=(
+            "Bo qua rerank (CrossEncoder) trong natural_question mode. "
+            "Nen dung khi chay tren CPU hoac top_stage1 lon. "
+            "Ket qua Stage 2 se dung thu tu FAISS goc thay vi rerank."
+        ),
+    )
     args = p.parse_args()
     run_rag_eval(
         args.testset_file, args.out_file, args.top_stage1, args.top_stage2,
-        args.mode, args.relevance_threshold,
+        args.mode, args.relevance_threshold, skip_rerank=args.skip_rerank,
     )

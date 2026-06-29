@@ -68,6 +68,7 @@ Chay (yeu cau full Docker stack dang chay, va image_id phai con trong cache):
 """
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -274,7 +275,8 @@ def run_qa_eval(
             "lan docker compose up -- xem ghi chu TTL o dau file nay)."
         )
 
-    raw_client = get_llm_client()
+    geval_backend = os.getenv("GEVAL_LLM_BACKEND") or os.getenv("LLM_BACKEND")
+    raw_client = get_llm_client(backend_override=geval_backend)
     judge_client = RateLimitedLLMClient(raw_client, rate_limit, max_retries, retry_base_delay)
     http_client = httpx.Client(timeout=timeout)
 

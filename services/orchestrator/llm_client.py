@@ -258,7 +258,8 @@ class OpenAIClient(BaseLLMClient):
                 model=self.model_name,
                 messages=messages,
             )
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            return content.strip() if content else ""
         except Exception as e:
             raise RuntimeError(f"[OpenAIClient] Generate failed: {e}")
 
@@ -275,7 +276,8 @@ class OpenAIClient(BaseLLMClient):
                 model=self.model_name,
                 messages=full_messages,
             )
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            return content.strip() if content else ""
         except Exception as e:
             raise RuntimeError(f"[OpenAIClient] Chat failed: {e}")
 
@@ -307,7 +309,8 @@ class OpenAIClient(BaseLLMClient):
                 model=self.model_name,
                 messages=messages,
             )
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content
+            return content.strip() if content else ""
         except Exception as e:
             raise RuntimeError(f"[OpenAIClient] generate_with_image failed: {e}")
 
@@ -386,7 +389,8 @@ class RemoteInferenceClient(BaseLLMClient):
             json={"model": self.model_name, "messages": messages},
         )
         resp.raise_for_status()
-        return resp.json()["choices"][0]["message"]["content"].strip()
+        content = resp.json()["choices"][0]["message"]["content"]
+        return content.strip() if content else ""
 
     def generate(self, prompt: str, system: Optional[str] = None) -> str:
         if self._pod_alive:
@@ -489,9 +493,11 @@ class MockLLMClient(BaseLLMClient):
 
 # Factory: chooses the client based on env
 
-def get_llm_client() -> BaseLLMClient:
+def get_llm_client(backend_override: str = None) -> BaseLLMClient:
     """
     Reads LLM_BACKEND from env -> returns the matching client.
+    Pass backend_override to use a different backend without changing env
+    (e.g. GEVAL_LLM_BACKEND in eval_qa.py to avoid self-preference bias).
 
     ollama   -> OllamaClient (default)
     google   -> GoogleGeminiClient
@@ -500,7 +506,7 @@ def get_llm_client() -> BaseLLMClient:
     local_hf -> LocalHFClient (fine-tuned model running locally, eval only)
     mock     -> MockLLMClient
     """
-    backend = os.getenv("LLM_BACKEND", "ollama").lower()
+    backend = (backend_override or os.getenv("LLM_BACKEND", "ollama")).lower()
 
     if backend == "ollama":
         return OllamaClient()
