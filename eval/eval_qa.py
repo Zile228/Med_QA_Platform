@@ -183,7 +183,16 @@ def _call_chat(http_client: httpx.Client, api_url: str, image_id: str, message: 
         resp.raise_for_status()
         return resp.json()["reply"]
     except Exception as e:
-        print(f"    [skip] /chat loi cho image_id={image_id}: {e}")
+        err_msg = str(e)
+        if "404" in err_msg:
+            print(
+                f"    [skip] /chat 404 for image_id={image_id}: context not in cache. "
+                "This means the orchestrator restarted or the TTL expired after "
+                "run_pipeline_batch.py ran. Re-run run_pipeline_batch.py and "
+                "eval_qa.py in the same Docker session without restarting the stack."
+            )
+        else:
+            print(f"    [skip] /chat error for image_id={image_id}: {e}")
         return None
 
 
@@ -273,6 +282,24 @@ def run_qa_eval(
             f"[eval_qa] 0 file JSON trong {pipeline_dir}. "
             "Chay eval/run_pipeline_batch.py truoc (NGAY TRUOC, trong cung 1 "
             "lan docker compose up -- xem ghi chu TTL o dau file nay)."
+        )
+
+    # ------------------------------------------------------------------
+    # Pre-flight: make sure the orchestrator is reachable and has the
+    # context cache populated (i.e. run_pipeline_batch.py was called in
+    # the SAME Docker session without restarting the orchestrator).
+    # /chat returns 404 when the image_id is not in _context_cache --
+    # this happens when the orchestrator process was restarted or the
+    # CHAT_CONTEXT_TTL (default 3600 s) expired between the two scripts.
+    # ------------------------------------------------------------------
+    try:
+        _probe = httpx.get(f"{api_url}/health", timeout=10.0)
+        _probe.raise_for_status()
+    except Exception as _e:
+        raise SystemExit(
+            f"[eval_qa] Cannot reach orchestrator at {api_url}/health: {_e}\n"
+            "Make sure `docker compose up` is running and run_pipeline_batch.py "
+            "was executed in this same Docker session BEFORE eval_qa.py."
         )
 
     geval_backend = os.getenv("GEVAL_LLM_BACKEND") or os.getenv("LLM_BACKEND")

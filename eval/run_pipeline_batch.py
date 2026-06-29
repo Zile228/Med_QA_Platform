@@ -112,6 +112,13 @@ def run_batch(
         organ = meta.get("organ") or organ_hint
 
         form_data = {}
+        # Pass a deterministic image_id derived from the filename so that
+        # eval_qa.py can call /chat with the same image_id that /analyze
+        # cached in _context_cache.  Without this, /analyze generates a
+        # random UUID, the JSON is saved with that UUID, but if the
+        # orchestrator restarts (or its in-memory cache is cleared) before
+        # eval_qa.py runs, every /chat call returns 404.
+        form_data["image_id"] = img_path.stem
         if organ:
             form_data["organ_hint"] = organ
         if modality_hint:
