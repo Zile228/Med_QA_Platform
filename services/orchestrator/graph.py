@@ -764,9 +764,10 @@ def make_cot_node(llm_client):
 
 def make_rag_node(rag_store, rag_mode: str = "two_stage"):
     """
-    RAG node. In two_stage mode, runs after spatial with query "{modality} {organ}".
-    In single_stage mode, returns empty chunks immediately (retrieve happens in
-    consistency_guard instead).
+    RAG node. In two_stage mode, runs after spatial with a query enriched
+    from modality, organ, and spatial features (location, aspect ratio
+    interpretation, circularity). In single_stage mode, returns empty
+    chunks immediately (retrieve happens in consistency_guard instead).
     """
     async def rag_node(state: OrchestratorState) -> OrchestratorState:
         if state.get("error"):
@@ -780,7 +781,21 @@ def make_rag_node(rag_store, rag_mode: str = "two_stage"):
         routing = state.get("routing") or {}
         modality = routing.get("modality", "ultrasound")
         organ = routing.get("organ")
-        query = f"{modality} {organ}".strip() if organ else modality
+        spatial = state.get("spatial") or {}
+
+        query_parts = [modality]
+        if organ:
+            query_parts.append(organ)
+        location_quadrant = spatial.get("location_quadrant")
+        if location_quadrant and location_quadrant != "none":
+            query_parts.append(location_quadrant)
+        aspect_ratio_interpretation = spatial.get("aspect_ratio_interpretation")
+        if aspect_ratio_interpretation:
+            query_parts.append(aspect_ratio_interpretation)
+        circularity = spatial.get("circularity")
+        if circularity is not None:
+            query_parts.append("irregular margin" if circularity < 0.5 else "regular margin")
+        query = " ".join(query_parts).strip()
 
         try:
             if rag_store and rag_store.is_ready():
@@ -817,6 +832,11 @@ def make_second_rag_retrieval(rag_store, rag_mode: str = "two_stage"):
     Second retrieve after the knowledge result is available.
     In two_stage mode: enriched query reranks candidates from first retrieve.
     In single_stage mode: single retrieve + rerank using enriched query directly.
+
+    The enriched query combines top_label, organ, modality, icd10_hint, and
+    BI-RADS/TI-RADS lexicon terms (taller-than-wide, irregular margin)
+    derived from spatial features, so it matches the vocabulary used in the
+    source clinical guidelines rather than a bare benign/malignant label.
     """
     async def second_retrieve(state: OrchestratorState) -> tuple:
         """
@@ -831,10 +851,28 @@ def make_second_rag_retrieval(rag_store, rag_mode: str = "two_stage"):
         organ = routing.get("organ")
         modality = routing.get("modality", "ultrasound")
         mo = state.get("model_output") or {}
+        spatial = state.get("spatial") or {}
         top_label = mo.get("top_label", "")
         icd10 = km.get("icd10_hint", "")
 
-        enriched_query = f"{top_label} {organ or ''} {modality} findings {icd10}".strip()
+        # top_label alone is too coarse ("benign"/"malignant") compared to
+        # how BI-RADS/TI-RADS documents describe a nodule/mass (margin,
+        # shape, echogenicity). Add the lexicon terms already computed for
+        # spatial features so the query matches the vocabulary used in the
+        # source guidelines.
+        lexicon_terms = []
+        aspect_ratio_interpretation = spatial.get("aspect_ratio_interpretation")
+        if aspect_ratio_interpretation and aspect_ratio_interpretation != "intermediate":
+            lexicon_terms.append(aspect_ratio_interpretation)
+        circularity = spatial.get("circularity")
+        if circularity is not None and circularity < 0.5:
+            lexicon_terms.append("irregular margin")
+        lexicon_text = " ".join(lexicon_terms)
+
+        enriched_query = (
+            f"{top_label} {organ or ''} {modality} {lexicon_text} findings {icd10}"
+        ).strip()
+        enriched_query = " ".join(enriched_query.split())
 
         if rag_mode == "single_stage":
             try:
@@ -1033,17 +1071,29 @@ def make_qa_agent_node(llm_client, rag_store):
             for m in rag_meta
         ]
 
+        organ_for_warning = routing.get("organ")
+        if not (rag_store and rag_store.is_ready()):
+            rag_disabled_warning = (
+                "RAG context not available -- report generated from classification "
+                "label and hardcoded mapping only, without clinical guideline retrieval."
+            )
+        elif not rag_chunks and organ_for_warning not in ("breast", "thyroid"):
+            rag_disabled_warning = (
+                f"No clinical guideline coverage for organ='{organ_for_warning}' -- "
+                "the RAG index only contains breast and thyroid ultrasound "
+                "guidelines. Report generated from classification label and "
+                "hardcoded mapping only, without clinical guideline retrieval."
+            )
+        else:
+            rag_disabled_warning = None
+
         state["report"] = {
             "image_id": state["image_id"],
             "tier_1_structured": tier1,
             "tier_2_radiological_description": tier2,
             "tier_3_diagnostic_suggestion": tier3,
             "rag_sources": rag_sources,
-            "rag_disabled_warning": (
-                None if (rag_store and rag_store.is_ready()) else
-                "RAG context not available -- report generated from classification "
-                "label and hardcoded mapping only, without clinical guideline retrieval."
-            ),
+            "rag_disabled_warning": rag_disabled_warning,
             "mapper_result": km,
             "cot_result": cot_result,
             "consensus": consensus,

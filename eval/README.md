@@ -247,29 +247,20 @@ python scripts/build_vectordb.py
 ### 3b. Sinh testset tu dong bang RAGAS
 
 ```bash
-python eval/generate_ragas_testset.py \
-  --docs_dir  services/orchestrator/rag/docs \
-  --out_file  eval/results/ragas_testset.json \
-  --n_samples 50
+python eval/generate_ragas_testset.py --docs_dir  services/orchestrator/rag/docs --out_file  eval/results/ragas_testset.json --n_samples 50
 ```
 
 ### 3c. Eval retrieval thuan (khong can anh, khong can Docker stack)
 
 ```bash
-python eval/eval_rag.py \
-  --testset_file eval/results/ragas_testset.json \
-  --out_file     eval/results/rag_retrieval.json \
-  --mode         both
+python eval/eval_rag.py --testset_file eval/results/ragas_testset.json --out_file     eval/results/rag_retrieval.json --mode         both
 ```
 (`both` = chay ca 2 cach query: `production_query` dung dung cach he thong
 thuc te goi RAG, va `natural_question` dung cau hoi tu nhien tu testset --
 2 so khac nhau, khong gop chung.)
 
 ```bash
-python eval/eval_ragas.py \
-  --mode         retrieval \
-  --testset_file eval/results/ragas_testset.json \
-  --out_file     eval/results/ragas_retrieval.csv
+python eval/eval_ragas.py --mode         retrieval --testset_file eval/results/ragas_testset.json --out_file     eval/results/ragas_retrieval.csv
 ```
 
 ### 3d. Eval faithfulness tren full pipeline (can anh thuc + Docker stack)

@@ -101,11 +101,12 @@ class MockRAGStore:
 
 # RAG node
 
-def test_rag_node_query_uses_modality_organ():
+def test_rag_node_query_uses_modality_organ_and_spatial():
     """
-    In two_stage mode, rag_node runs before vision finishes and uses
-    "{modality} {organ}" from the routing result as the initial broad query.
-    The enriched query (with top_label + icd10) happens in consistency_guard.
+    In two_stage mode, rag_node runs after spatial and builds the initial
+    broad query from modality, organ, and spatial features (location,
+    aspect ratio interpretation, circularity-derived margin description).
+    The label/icd10-enriched query happens later, in consistency_guard.
     """
     store = MockRAGStore()
     rag_node = make_rag_node(store)
@@ -113,10 +114,21 @@ def test_rag_node_query_uses_modality_organ():
     state = _base_state()
     result = asyncio.run(rag_node(state))
 
-    assert store.last_query == "ultrasound breast"
+    assert store.last_query == "ultrasound breast upper-outer intermediate regular margin"
     assert "benign" not in (store.last_query or "")
     assert "us_breast" not in (store.last_query or "")
     assert result["rag_chunks"] == ["chunk A", "chunk B"]
+
+
+def test_rag_node_query_falls_back_to_modality_organ_when_spatial_missing():
+    """When spatial features are absent, the query stays as "{modality} {organ}"."""
+    store = MockRAGStore()
+    rag_node = make_rag_node(store)
+
+    state = _base_state(spatial={})
+    asyncio.run(rag_node(state))
+
+    assert store.last_query == "ultrasound breast"
 
 
 def test_rag_node_returns_empty_when_store_not_ready():

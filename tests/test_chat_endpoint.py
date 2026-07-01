@@ -86,6 +86,72 @@ def test_chat_uses_cached_context_not_reanalyzing():
     assert entry is not None
 
 
+def test_save_context_stores_organ_from_report():
+    """_save_context must extract organ from tier_1_structured for later RAG re-retrieve."""
+    orch_main._context_cache.clear()
+    report = _make_report_dict("with_organ")
+    orch_main._save_context("with_organ", report, [])
+
+    entry = orch_main._context_cache["with_organ"]
+    assert entry["organ"] == "breast"
+
+
+def test_chat_re_retrieves_rag_with_follow_up_question():
+    """
+    /chat must call rag_store.retrieve_with_meta() with the follow-up
+    question text (not the original /analyze query), and must pass the
+    organ saved at /analyze time as organ_filter.
+    """
+    from services.orchestrator.main import ChatRequest
+
+    orch_main._context_cache.clear()
+    report = _make_report_dict("follow_up_01")
+    orch_main._save_context("follow_up_01", report, ["original chunk"])
+
+    mock_rag_store = MagicMock()
+    mock_rag_store.is_ready.return_value = True
+    mock_rag_store.retrieve_with_meta.return_value = [
+        {"chunk": "follow up chunk", "source_file": "test.pdf", "page_number": 1, "organ": "breast"}
+    ]
+
+    mock_llm = MagicMock()
+    mock_llm.generate.return_value = "mocked reply"
+
+    with patch.object(orch_main, "_rag_store", mock_rag_store), \
+         patch.object(orch_main, "_llm_client", mock_llm):
+        req = ChatRequest(image_id="follow_up_01", message="Is FNA needed?", history=[])
+        response = asyncio.run(orch_main.chat(req))
+
+    mock_rag_store.retrieve_with_meta.assert_called_once_with(
+        "Is FNA needed?", 3, "breast"
+    )
+    assert response.reply == "mocked reply"
+
+
+def test_chat_keeps_saved_chunks_when_rag_store_not_ready():
+    """When the RAG store is not ready, /chat must fall back to the saved rag_chunks."""
+    from services.orchestrator.main import ChatRequest
+
+    orch_main._context_cache.clear()
+    report = _make_report_dict("no_rag")
+    orch_main._save_context("no_rag", report, ["saved chunk"])
+
+    mock_rag_store = MagicMock()
+    mock_rag_store.is_ready.return_value = False
+
+    mock_llm = MagicMock()
+    mock_llm.generate.return_value = "mocked reply"
+
+    with patch.object(orch_main, "_rag_store", mock_rag_store), \
+         patch.object(orch_main, "_llm_client", mock_llm):
+        req = ChatRequest(image_id="no_rag", message="Any question", history=[])
+        asyncio.run(orch_main.chat(req))
+
+    mock_rag_store.retrieve_with_meta.assert_not_called()
+    prompt_used = mock_llm.generate.call_args[0][0]
+    assert "saved chunk" in prompt_used
+
+
 # _build_chat_prompt
 
 from services.orchestrator.graph import _build_chat_prompt

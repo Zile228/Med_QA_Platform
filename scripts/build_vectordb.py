@@ -16,6 +16,15 @@ filename:
     - name contains "thyroid" or "tirads" -> "thyroid"
     - otherwise -> "general"
 
+Only PDFs whose filename matches ALLOWED_PDF_FILENAMES are indexed. This
+is an allow-list rather than an exclude-list because the indexed documents
+are short clinical guidelines where each chunk needs surrounding context
+to be useful for retrieval. A coded reference table such as an ICD-10
+tabular list (one short disease-code line per chunk, no surrounding
+context) would get tagged organ="general" and silently bypass every
+organ_filter, so a new PDF of that kind must be added to the allow-list
+explicitly rather than being picked up automatically by an exclude-list.
+
 Usage:
     python scripts/build_vectordb.py
     python scripts/build_vectordb.py --docs_dir rag/docs --out_dir rag/vectordb
@@ -38,6 +47,17 @@ _MP_SPAWN_CTX = mp.get_context("spawn")
 
 
 PAGE_MARKER_RE = re.compile(r"<!--page:(\d+)-->")
+
+# Allow-list of indexable PDF filenames (case-insensitive, exact basename
+# match). See the module docstring above for why this is an allow-list
+# rather than an exclude-list.
+ALLOWED_PDF_FILENAMES = {
+    "2016.2015.American.Thyroid.Association.Management.pdf",
+    "839806731-Breast-Ultrasound.pdf",
+    "ACR_Thyroid_Imaging.pdf",
+    "BIRADS_mass.pdf",
+    "ESR_Modern_eBook_11_Breast.pdf",
+}
 
 # pymupdf4llm wraps OCR'd image/table text with these markers and uses
 # <br> as its line break; neither has semantic value for embedding.
@@ -94,10 +114,25 @@ def _count_pages(pdf_path: str) -> int:
 
 
 def _markdown_worker(pdf_path: str, result_queue: mp.Queue):
-    """Runs the actual conversion in a subprocess so it can be killed on timeout."""
+    """
+    Runs the actual conversion in a subprocess so it can be killed on timeout.
+
+    Layout mode's bundled GNN model has a known int32/int64 dtype bug on
+    Windows (numpy's default platform int is 32-bit there), raised as
+    ONNXRuntimeError before any text is extracted. This is not a problem
+    with the PDF itself, so on that specific error this falls back to
+    legacy mode (pymupdf4llm.use_layout(False)) and retries once, the same
+    fallback strategy already used in eval/generate_ragas_testset.py.
+    """
     try:
         import pymupdf4llm
-        page_dicts = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
+        try:
+            page_dicts = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
+        except Exception as e:
+            if "Unexpected input data type" not in str(e):
+                raise
+            pymupdf4llm.use_layout(False)
+            page_dicts = pymupdf4llm.to_markdown(pdf_path, page_chunks=True)
         parts = []
         for i, page_dict in enumerate(page_dicts, start=1):
             text = (page_dict.get("text") or "").strip()
@@ -281,10 +316,23 @@ def main():
     args = parse_args()
     os.makedirs(args.out_dir, exist_ok=True)
 
-    pdf_files = glob.glob(os.path.join(args.docs_dir, "**/*.pdf"), recursive=True)
-    if not pdf_files:
+    all_found = glob.glob(os.path.join(args.docs_dir, "**/*.pdf"), recursive=True)
+    if not all_found:
         print(f"[build_vectordb] No PDF found in {args.docs_dir}")
         print("Place clinical PDF files in the docs/ directory then run again.")
+        sys.exit(0)
+
+    pdf_files = [
+        p for p in all_found
+        if os.path.basename(p).lower() in {n.lower() for n in ALLOWED_PDF_FILENAMES}
+    ]
+    skipped = sorted(set(all_found) - set(pdf_files))
+    for p in skipped:
+        print(f"  [SKIP] {os.path.basename(p)} not in ALLOWED_PDF_FILENAMES -- not indexed.")
+
+    if not pdf_files:
+        print(f"[build_vectordb] {len(all_found)} PDF found in {args.docs_dir}, "
+              "but none match ALLOWED_PDF_FILENAMES.")
         sys.exit(0)
 
     print(f"[build_vectordb] Found {len(pdf_files)} PDF files")

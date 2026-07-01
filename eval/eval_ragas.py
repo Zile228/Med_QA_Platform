@@ -61,12 +61,23 @@ Chay day du (can testset tu generate_ragas_testset.py):
     --out_file eval/results/ragas_retrieval.csv
 """
 import argparse
+import asyncio
 import json
 import os
 import sys
 from pathlib import Path
 
 import pandas as pd
+
+# RAGAS evaluate() co the goi asyncio.run() nhieu lan tuan tu; moi lan dong
+# loop khi xong (dung cho ca Proactor lan Selector). Neu httpx.AsyncClient
+# duoc tao mot lan roi tai su dung qua nhieu lan goi nhu vay se gay
+# RuntimeError: Event loop is closed -- fix that su la KHONG truyen
+# http_async_client tuong minh trong _get_ragas_llm_embeddings() (xem
+# comment tai do). Selector duoc giu o day vi on dinh hon cho I/O khac tren
+# Windows, khong phai vi no tu no sua duoc loi Event loop is closed.
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -103,11 +114,19 @@ def _get_ragas_llm_embeddings():
 
         openai_api_key = os.environ["OPENAI_API_KEY"]
         openai_model = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+        # KHONG truyen http_async_client=httpx.AsyncClient() tuong minh o day
+        # (da thu va KHONG du -- xem giai thich chi tiet trong
+        # eval/generate_ragas_testset.py::_get_testset_llm_embeddings(), cung
+        # bug, cung fix). Tom tat: mot httpx.AsyncClient tao MOT LAN roi tai
+        # su dung qua nhieu evaluate()/asyncio.run() se giu tham chieu toi
+        # transport gan voi loop da bi dong tu lan goi truoc -> RuntimeError:
+        # Event loop is closed. Bo tham so nay de OpenAI SDK lazy-tao client
+        # rieng dung luc request chay, ben trong loop hien tai.
         ragas_llm = LangchainLLMWrapper(
             ChatOpenAI(model=openai_model, api_key=openai_api_key)
         )
         ragas_embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small", api_key=openai_api_key
+            model="text-embedding-3-small", api_key=openai_api_key,
         )
         return ragas_llm, ragas_embeddings
 

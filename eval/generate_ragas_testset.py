@@ -25,9 +25,11 @@ loi cua file PDF -- file van doc duoc bang fitz thuan. _load_pdf_documents()
 tu dong thu _fitz_fallback_text() (fitz.get_text) khi gap loi nay, nen cac
 PDF bi ONNX error van duoc dua vao testset thay vi bi bo qua im lang.
 
-Organ duoc gan vao metadata moi Document tu ten file PDF, dung cung logic
-_detect_organ() nhu build_vectordb.py ("breast"/"birads" -> breast,
-"thyroid"/"tirads" -> thyroid, khac -> general) -- de cac sample trong
+Chi index cac PDF khop ALLOWED_PDF_FILENAMES (import truc tiep tu
+scripts/build_vectordb.py, khong copy lai) -- cung allow-list dang dung de
+build FAISS index, nen testset sinh ra luon phan anh dung tap tai lieu thuc
+te trong vectordb. Organ duoc gan vao metadata moi Document tu ten file PDF
+qua _detect_organ() (cung import tu build_vectordb.py) de cac sample trong
 testset sinh ra co the dung field "organ" cho production_query mode trong
 eval_rag.py.
 
@@ -80,24 +82,38 @@ Chay:
     --n_samples  50 --rpm 30
 """
 import argparse
+import asyncio
 import glob
 import os
+import re
+import sys
 from pathlib import Path
+
+# RAGAS goi asyncio.run() nhieu lan TUAN TU (moi transform pipeline mot lan:
+# SummaryExtractor, EmbeddingExtractor, ThemesExtractor, NERExtractor...).
+# asyncio.run() luon dong loop khi coroutine xong -- dieu nay dung cho CA
+# ProactorEventLoop lan SelectorEventLoop, nen doi policy KHONG tu no giai
+# quyet duoc "RuntimeError: Event loop is closed". Nguyen nhan that: neu
+# httpx.AsyncClient duoc tao MOT LAN roi tai su dung qua nhieu asyncio.run(),
+# client se giu tham chieu toi transport gan voi loop da bi dong tu lan
+# truoc. Fix that su nam o _get_testset_llm_embeddings() (KHONG truyen
+# http_async_client tuong minh, de SDK lazy-tao client dung trong tung loop).
+# Selector van duoc giu lai o day vi no on dinh hon Proactor cho cac tac vu
+# I/O khac tren Windows (vi du subprocess cua thu vien khac dung sau nay),
+# nhung ban than no khong phai fix cho loi Event loop is closed noi tren.
+if sys.platform.startswith("win"):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# Dung chung allow-list va logic gan organ voi scripts/build_vectordb.py, thay
+# vi duy tri 2 ban sao co the lech pha nhau. parents[1] la project root vi
+# file nay nam o eval/, giong pattern da dung trong eval/eval_rag.py.
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from scripts.build_vectordb import ALLOWED_PDF_FILENAMES, _detect_organ
 
 # Script nay chay standalone, .env khong tu doc nhu trong container.
 # Phai load o day, neu khong cac bien GOOGLE_API_KEY/OPENAI_API_KEY se rong.
 from dotenv import load_dotenv
 load_dotenv(Path(__file__).resolve().parents[1] / ".env")
-
-
-def _detect_organ(filename: str) -> str:
-    """Giong _detect_organ() trong scripts/build_vectordb.py, suy organ tu ten file PDF."""
-    name = filename.lower()
-    if "breast" in name or "birads" in name or "bi-rads" in name:
-        return "breast"
-    if "thyroid" in name or "tirads" in name or "ti-rads" in name:
-        return "thyroid"
-    return "general"
 
 
 def _fitz_fallback_text(pdf_path: str) -> str:
@@ -141,6 +157,11 @@ _CHUNK_OVERLAP_TOKENS = 30
 # phan dau ma bo qua nua sau cua tai lieu.
 _MAX_CHUNKS_PER_FILE = 50    # sample toi da 50 chunks moi PDF
 _MAX_CHUNKS_TOTAL = 300      # cap tong so chunks dua vao RAGAS
+
+# RAGAS multi-hop synthesizer chen prefix nay vao dau moi context trong
+# reference_contexts; chunk goc khong co prefix nay nen phai cat truoc khi
+# so khop organ (xem _organ_from_ref_contexts trong main()).
+_HOP_PREFIX_RE = re.compile(r"^<\d+-hop>\s*")
 
 
 def _chunk_text_to_documents(text: str, filename: str, chunk_tokens: int,
@@ -197,8 +218,14 @@ def _load_pdf_documents(
     max_chunks_total: int = _MAX_CHUNKS_TOTAL,
 ) -> list:
     """
-    Doc toan bo PDF trong docs_dir, tra ve list LangChain Document da chunk san,
+    Doc toan bo PDF trong docs_dir khop ALLOWED_PDF_FILENAMES (xem
+    scripts/build_vectordb.py), tra ve list LangChain Document da chunk san,
     co cap so luong de kiem soat runtime cua RAGAS SummaryExtractor.
+
+    Dung chung allow-list voi scripts/build_vectordb.py de testset sinh ra
+    tu dung cung tap PDF da duoc index vao FAISS -- PDF dang bang tra cuu ma
+    benh (ICD-10) khong nam trong allow-list vi khong phai van ban lam sang
+    dien giai, xem ly do chi tiet trong docstring ALLOWED_PDF_FILENAMES.
 
     Moi PDF duoc:
     1. Chuyen sang text qua pymupdf4llm.to_markdown() (giu heading/bang).
@@ -208,9 +235,9 @@ def _load_pdf_documents(
     5. Cap tong toi da max_chunks_total (shuffle + slice de phan bo deu).
 
     Ly do cap:
-    SummaryExtractor cua RAGAS goi 1 LLM request cho moi chunk. Voi 13k+ chunks
-    tu 6 PDF lon (icd10cm: 7479, breast ultrasound: 4382), SummaryExtractor se
-    ton ~7 gio o 30 RPM. Cap giup giu runtime o 10-15 phut (300 chunks x 2s/req).
+    SummaryExtractor cua RAGAS goi 1 LLM request cho moi chunk. max_chunks_total
+    gioi han tong so LLM call du so PDF trong allow-list la bao nhieu, giu
+    runtime o muc du doan duoc (vi du 300 chunks x 2s/req ~ 10-15 phut o 30 RPM).
 
     Ly do chunking truoc (thay vi de RAGAS tu chunk):
     RAGAS HeadlineSplitter noi bo loop rat lau voi doc khong co heading ro rang
@@ -223,7 +250,12 @@ def _load_pdf_documents(
 
     ONNX_DTYPE_ERRMSG = "Unexpected input data type"
 
-    pdf_files = sorted(glob.glob(os.path.join(docs_dir, "**/*.pdf"), recursive=True))
+    all_found = sorted(glob.glob(os.path.join(docs_dir, "**/*.pdf"), recursive=True))
+    allowed_lower = {n.lower() for n in ALLOWED_PDF_FILENAMES}
+    pdf_files = [p for p in all_found if os.path.basename(p).lower() in allowed_lower]
+    for p in sorted(set(all_found) - set(pdf_files)):
+        print(f"  [SKIP] {os.path.basename(p)} not in ALLOWED_PDF_FILENAMES -- not used for testset.")
+
     all_chunks: list = []
 
     for pdf_path in pdf_files:
@@ -317,6 +349,27 @@ def _get_testset_llm_embeddings(rpm: int):
         openai_api_key = os.environ["OPENAI_API_KEY"]
         openai_model = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
         print(f"[llm] OpenAI model: {openai_model} (bypass_temperature=True)")
+        # KHONG truyen http_async_client=httpx.AsyncClient() tuong minh o day.
+        #
+        # RAGAS goi asyncio.run() nhieu lan TUAN TU, moi lan cho 1 cum
+        # transform (SummaryExtractor, EmbeddingExtractor, ThemesExtractor,
+        # NERExtractor...). asyncio.run() luon DONG loop khi coroutine xong,
+        # bat ke loop la Proactor hay Selector -- doi loop policy (ban truoc)
+        # khong sua duoc van de nay.
+        #
+        # Neu tao httpx.AsyncClient() MOT LAN ben ngoai (nhu ban cu), object
+        # do song xuyen suot ca process, con loop no dung lan dau thi da bi
+        # asyncio.run() dong ngay sau lan goi dau tien. Lan goi thu 2 tai su
+        # dung client cu -> client giu tham chieu toi transport gan voi loop
+        # da dong -> "RuntimeError: Event loop is closed" (xay ra o buoc
+        # aclose() khi httpcore don dep connection, thay vi luc gui request).
+        #
+        # AsyncOpenAI (SDK goc, ChatOpenAI dung ben trong) tu lazy-tao
+        # httpx.AsyncClient rieng NEU khong truyen http_client/http_async_client.
+        # Client lazy nay duoc tao dung luc request dau tien chay, tuc la BEN
+        # TRONG coroutine dang chay tren loop hien tai -- khong bi "mang theo"
+        # tu loop cu sang loop moi. Bo tham so nay di la cach don gian nhat
+        # de moi asyncio.run() co client rieng, khop dung voi loop cua no.
         generator_llm = ChatOpenAI(
             model=openai_model,
             api_key=openai_api_key,
@@ -324,7 +377,7 @@ def _get_testset_llm_embeddings(rpm: int):
             rate_limiter=rate_limiter,
         )
         embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small", api_key=openai_api_key
+            model="text-embedding-3-small", api_key=openai_api_key,
         )
         return generator_llm, embeddings, True   # bypass_temperature=True
 
@@ -405,16 +458,26 @@ def main(docs_dir: str, out_file: str, n_samples: int, rpm: int,
             for doc in chunks
         }
 
+        # Cac synthesizer multi-hop (single_hop_specific_query_synthesizer,
+        # multi_hop_*) chen prefix "<N-hop>\n\n" vao dau moi context trong
+        # reference_contexts. Prefix nay khong ton tai trong chunk goc, nen
+        # phai bi cat truoc khi so khop, neu khong ca exact match lan
+        # partial-prefix match ben duoi deu truot va moi mau co prefix nay
+        # se bi gan nham organ="general".
+        def _strip_hop_prefix(ctx: str) -> str:
+            return _HOP_PREFIX_RE.sub("", ctx)
+
         def _organ_from_ref_contexts(ref_ctxs) -> str:
             if not isinstance(ref_ctxs, list):
                 return "general"
-            for ctx in ref_ctxs:
-                if isinstance(ctx, str) and ctx in chunk_organ:
+            cleaned = [
+                _strip_hop_prefix(ctx) for ctx in ref_ctxs if isinstance(ctx, str)
+            ]
+            for ctx in cleaned:
+                if ctx in chunk_organ:
                     return chunk_organ[ctx]
             # Fallback: partial match 120 ky tu dau de xu ly RAGAS trim text
-            for ctx in ref_ctxs:
-                if not isinstance(ctx, str):
-                    continue
+            for ctx in cleaned:
                 prefix = ctx[:120]
                 for chunk_text, organ in chunk_organ.items():
                     if chunk_text.startswith(prefix) or prefix in chunk_text:

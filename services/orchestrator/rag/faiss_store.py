@@ -10,6 +10,10 @@ Metadata (source_file, page_number, page_end, section_heading, organ) is
 loaded from metadata.pkl if present. An index without metadata.pkl still
 works, falling back to a "general" placeholder for every chunk.
 
+organ_filter only matches "breast" or "thyroid" exactly; any other value
+(including "chest", "unknown", or "general" itself) returns no results
+instead of silently falling back -- see _filter_by_organ() for the reasoning.
+
 Public API:
     FAISSStore(index_path, docs_path)
     FAISSStore.retrieve(query, k, organ_filter) -> List[str]
@@ -128,8 +132,17 @@ class FAISSStore:
 
     def _filter_by_organ(self, indices, distances, organ_filter: Optional[str]):
         """
-        Keeps chunks whose metadata.organ matches organ_filter or is "general".
+        Keeps chunks whose metadata.organ matches organ_filter exactly.
         If organ_filter is None, returns everything (no filtering).
+
+        After build_vectordb.py's allow-list (see ALLOWED_PDF_FILENAMES),
+        every indexed chunk is tagged organ="breast" or organ="thyroid";
+        the "general" placeholder is no longer expected to have real
+        clinical content behind it. organ_filter values outside
+        {"breast", "thyroid"} (e.g. "chest", "unknown") therefore return
+        no results instead of silently falling back to "general" -- a
+        caller should treat that as "no clinical guideline coverage for
+        this organ" rather than receive unrelated chunks.
         """
         if organ_filter is None:
             return [
@@ -138,6 +151,9 @@ class FAISSStore:
                 if 0 <= idx < len(self._chunks)
             ]
 
+        if organ_filter not in ("breast", "thyroid"):
+            return []
+
         result = []
         for idx, dist in zip(indices, distances):
             idx = int(idx)
@@ -145,7 +161,7 @@ class FAISSStore:
                 continue
             meta = self._metadata[idx] if idx < len(self._metadata) else {}
             chunk_organ = meta.get("organ", "general")
-            if chunk_organ in (organ_filter, "general"):
+            if chunk_organ == organ_filter:
                 result.append((idx, float(dist)))
         return result
 

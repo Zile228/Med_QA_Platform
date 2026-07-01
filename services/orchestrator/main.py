@@ -103,21 +103,22 @@ _context_cache: dict = {}
 
 _graph       = None
 _llm_client  = None
+_rag_store   = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _graph, _llm_client
+    global _graph, _llm_client, _rag_store
     setup_tracing("orchestrator", app=app)
     print("[orchestrator] Initializing pipeline...")
 
     _llm_client = get_llm_client()
-    rag_store   = FAISSStore(index_path=FAISS_INDEX_PATH)
+    _rag_store  = FAISSStore(index_path=FAISS_INDEX_PATH)
 
-    if not rag_store.is_ready():
+    if not _rag_store.is_ready():
         print("[orchestrator] RAG index not ready -- LLM will run without clinical context.")
 
-    _graph = build_graph(SERVICES_CFG, _llm_client, rag_store, registry=_registry)
+    _graph = build_graph(SERVICES_CFG, _llm_client, _rag_store, registry=_registry)
     print(f"[orchestrator] Graph ready -- services: {SERVICES_CFG}")
     print(
         f"[orchestrator] Vision modalities: "
@@ -157,12 +158,14 @@ class ChatResponse(BaseModel):
 
 def _save_context(image_id: str, report_dict: dict, rag_chunks: list):
     """Save context into the cache after /analyze succeeds."""
+    organ = report_dict.get("tier_1_structured", {}).get("organ")
     _context_cache[image_id] = {
         "context": {
             "image_id": image_id,
             "report":   report_dict,
         },
         "rag_chunks": rag_chunks,
+        "organ": organ,
         "ts": time.time(),
     }
 
@@ -370,15 +373,34 @@ async def chat(req: ChatRequest):
     Multi-turn chatbot built on already-analyzed context.
 
     Does not take the image again -- reuses context from _context_cache by
-    image_id. Vision/router/knowledge are NOT called again -- only the LLM
-    is called with context + history.
+    image_id. Vision/router/knowledge are NOT called again -- only RAG is
+    re-queried with the follow-up question text, then the LLM is called
+    with context + history.
+
+    rag_chunks saved at /analyze time stay relevant to the original finding,
+    so they are kept as background context. Chunks retrieved for this
+    specific follow-up question are placed first, since they are most
+    likely to answer what the user is actually asking now.
     """
     if _llm_client is None:
         raise HTTPException(status_code=503, detail="LLM client not ready.")
 
     entry = _get_context(req.image_id)
     unified_context = entry["context"]
-    rag_chunks      = entry["rag_chunks"]
+    saved_rag_chunks = entry["rag_chunks"]
+    organ = entry.get("organ")
+
+    rag_chunks = saved_rag_chunks
+    if _rag_store and _rag_store.is_ready():
+        try:
+            follow_up_meta = await asyncio.to_thread(
+                _rag_store.retrieve_with_meta, req.message, 3, organ
+            )
+            follow_up_chunks = [m["chunk"] for m in follow_up_meta]
+            seen = set(follow_up_chunks)
+            rag_chunks = follow_up_chunks + [c for c in saved_rag_chunks if c not in seen]
+        except Exception as e:
+            logger.exception("Chat follow-up RAG retrieve failed -- falling back to saved context")
 
     history_dicts = [{"role": m.role, "content": m.content} for m in req.history]
 

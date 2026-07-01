@@ -8,12 +8,19 @@ QUAN TRONG -- 2 cach query khac nhau, KHONG the dung lan nhau:
 
   production_query mode:
     Dung dung cach pipeline thuc te tu graph.py xay query:
-      Stage 1: query = "{modality} {organ}"               -> retrieve_with_meta(k=100)
-      Stage 2: enriched = "{top_label} {organ} {modality} findings {icd10}"
+      Stage 1: query = "{modality} {organ} {location_quadrant} \\
+               {aspect_ratio_interpretation} {irregular/regular margin}"
+               -> retrieve_with_meta(k=100)
+      Stage 2: enriched = "{top_label} {organ} {modality} \\
+               {lexicon_terms_tu_spatial} findings {icd10}"
                -> retrieve them 5, merge voi stage 1 (dedup), rerank top_n=3
     Day la cach he thong THUC SU goi RAG trong production (xem
-    make_rag_retrieval_node / make_second_rag_retrieval trong graph.py).
+    make_rag_node / make_second_rag_retrieval trong graph.py).
     Can metadata moi sample: organ, modality, top_label, icd10_hint.
+    spatial (location_quadrant, aspect_ratio_interpretation, circularity)
+    la tuy chon -- neu thieu, query roi ve dang cu "{modality} {organ}"
+    nhu truoc khi co B1/B2, giong hanh vi that cua graph.py khi
+    state["spatial"] rong.
     Khong dung cau hoi tu nhien.
 
   natural_question mode:
@@ -44,7 +51,8 @@ Input testset JSON sinh boi eval/generate_ragas_testset.py. Doc ca 2 schema
 cot ("user_input"/"reference" cua ragas >=0.2, hoac "question"/"ground_truth"
 cua ban cu) de tuong thich nguoc. Cho production_query mode, testset item can
 them cac key metadata: "organ", "modality" (vd: "breast", "ultrasound");
-"top_label" va "icd10_hint" la tuy chon, mac dinh rong neu thieu.
+"top_label", "icd10_hint", "location_quadrant", "aspect_ratio_interpretation",
+"circularity" deu tuy chon, mac dinh rong/bo qua neu thieu.
 
 QUAN TRONG: FAISSStore.retrieve_with_meta() nhan tham so "k" (khong phai
 "top_k") -- xem services/orchestrator/rag/faiss_store.py.
@@ -172,12 +180,54 @@ def _aggregate(per_query: list) -> dict:
     }
 
 
+def _build_stage1_query(item: dict, modality: str, organ: str) -> str:
+    """
+    Phai khop chinh xac voi logic xay query trong make_rag_node() cua
+    graph.py (state["spatial"] -> location_quadrant, aspect_ratio_interpretation,
+    circularity). Neu graph.py doi cach xay query, sua ca 2 noi cung luc.
+    """
+    query_parts = [modality, organ]
+    location_quadrant = item.get("location_quadrant")
+    if location_quadrant and location_quadrant != "none":
+        query_parts.append(location_quadrant)
+    aspect_ratio_interpretation = item.get("aspect_ratio_interpretation")
+    if aspect_ratio_interpretation:
+        query_parts.append(aspect_ratio_interpretation)
+    circularity = item.get("circularity")
+    if circularity is not None:
+        query_parts.append("irregular margin" if circularity < 0.5 else "regular margin")
+    return " ".join(query_parts).strip()
+
+
+def _build_stage2_query(item: dict, modality: str, organ: str) -> str:
+    """
+    Phai khop chinh xac voi logic xay enriched_query trong
+    make_second_rag_retrieval() cua graph.py. Neu graph.py doi cach xay
+    query, sua ca 2 noi cung luc.
+    """
+    top_label = item.get("top_label", "")
+    icd10 = item.get("icd10_hint", "")
+
+    lexicon_terms = []
+    aspect_ratio_interpretation = item.get("aspect_ratio_interpretation")
+    if aspect_ratio_interpretation and aspect_ratio_interpretation != "intermediate":
+        lexicon_terms.append(aspect_ratio_interpretation)
+    circularity = item.get("circularity")
+    if circularity is not None and circularity < 0.5:
+        lexicon_terms.append("irregular margin")
+    lexicon_text = " ".join(lexicon_terms)
+
+    enriched_query = f"{top_label} {organ} {modality} {lexicon_text} findings {icd10}"
+    return " ".join(enriched_query.split())
+
+
 def run_production_query_eval(store, testset: list, top1: int, top2: int, threshold: float) -> dict:
     """
-    Eval theo dung cach graph.py goi RAG: query Stage 1 = "{modality} {organ}",
-    Stage 2 enriched = "{top_label} {organ} {modality} findings {icd10}",
-    retrieve them 5, merge voi stage1 (dedup theo text), rerank top_n.
-    Can testset item co key "organ" va "modality"; "top_label"/"icd10_hint" tuy chon.
+    Eval theo dung cach graph.py goi RAG (xem _build_stage1_query va
+    _build_stage2_query o tren), retrieve them 5 o stage 2, merge voi
+    stage1 (dedup theo text), rerank top_n.
+    Can testset item co key "organ" va "modality"; "top_label"/"icd10_hint"/
+    spatial fields tuy chon.
     """
     per_query = []
     n_skipped = 0
@@ -189,12 +239,10 @@ def run_production_query_eval(store, testset: list, top1: int, top2: int, thresh
             n_skipped += 1
             continue
 
-        query = f"{modality} {organ}".strip()
+        query = _build_stage1_query(item, modality, organ)
         stage1_results = store.retrieve_with_meta(query, k=top1, organ_filter=organ)
 
-        top_label = item.get("top_label", "")
-        icd10 = item.get("icd10_hint", "")
-        enriched_query = f"{top_label} {organ} {modality} findings {icd10}".strip()
+        enriched_query = _build_stage2_query(item, modality, organ)
         meta2 = store.retrieve_with_meta(enriched_query, k=5, organ_filter=organ)
 
         existing_texts = {r["chunk"] for r in stage1_results}
