@@ -26,8 +26,11 @@ data/tn3k/*
 data/router/*
 !data/router/.gitkeep
 
+eval/.ipynb
 eval/results/*
 !eval/results/.gitkeep
+
+scripts/finetune_data
 
 # --- Vector Database & RAG ---
 # Bỏ qua cơ sở dữ liệu vector được tạo ra khi chạy chương trình

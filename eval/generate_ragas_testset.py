@@ -7,23 +7,68 @@ trong RAG knowledge base. Khong viet ground truth tay.
 QUAN TRONG -- tai lieu RAG la PDF, KHONG phai .txt:
 scripts/build_vectordb.py doc PDF qua pymupdf4llm.to_markdown() (xem ham
 pdf_to_marked_markdown() trong file do), KHONG doc .txt. Script nay dung lai
-cung pymupdf4llm de convert PDF -> Markdown, sau do cat chunk bang
-RecursiveCharacterTextSplitter (200 token, 30 overlap -- giong build_vectordb.py)
-truoc khi dua vao RAGAS qua generate_with_chunks().
+CUNG MOT pipeline tien xu ly voi build_vectordb.py -- khong tu chunk rieng
+nua -- de testset phan anh dung granularity va noi dung thuc su nam trong
+FAISS index:
 
-Ly do phai chunk truoc:
+    pdf_to_marked_markdown()  (page markers <!--page:N-->, co timeout/subprocess)
+        -> split_into_sections()   (tach theo heading Markdown H1-H4)
+        -> _is_reference_heading() (bo section "References"/"Bibliography")
+        -> chunk_section()         (cat theo token cua CHINH embedder that,
+                                     khong phai tiktoken -- xem phan duoi)
+        -> _looks_like_reference_chunk() (bo chunk citation-list con sot lai
+                                     trong 1 section noi dung binh thuong)
+
+4 ham + 2 regex-filter tren deu IMPORT TRUC TIEP tu scripts/build_vectordb.py
+(khong copy lai) de 2 pipeline khong bao gio lech pha nhau.
+
+Sau khi co list Document da chunk dung chuan production, moi dua vao RAGAS
+qua generate_with_chunks().
+
+TAI SAO PHAI DUNG EMBEDDER TOKENIZER THAT (khong con dung tiktoken cl100k_base):
+build_vectordb.py dem token bang embedder.tokenizer (tokenizer cua chinh
+model embedding se encode cac chunk nay, xem chunk_section() trong
+build_vectordb.py). tiktoken cl100k_base la tokenizer cua OpenAI, cho ra
+token count KHAC (thuong it token hon cho cung 1 doan text y khoa) --
+dung no de cat chunk_tokens=200 se tao ra chunk DAI HON thuc te so voi
+chunk nam trong FAISS index, khien testset khong con phan anh dung
+granularity retrieval that. Script nay gio load cung 1 embedding model
+(--model, mac dinh trung voi build_vectordb.py) chi de lay .tokenizer,
+KHONG dung no de encode/tao embedding (viec do van do GoogleGenerativeAIEmbeddings/
+OpenAIEmbeddings cua RAGAS dam nhiem o buoc generate).
+
+Ly do phai chunk truoc (khong de RAGAS tu chunk):
 RAGAS HeadlineSplitter noi bo loop rat cham khi gap Document khong lo khong co
 heading (dac biet la fallback fitz). Script dung generate_with_chunks() de RAGAS
 biet day la pre-chunked data va dung default_transforms_for_prechunked(), bo qua
 hoan toan HeadlinesExtractor + HeadlineSplitter.
 
-FALLBACK fitz khi gap loi ONNX int32/int64:
+FALLBACK fitz khi gap loi ONNX int32/int64 HOAC khi pdf_to_marked_markdown()
+timeout/loi:
 pymupdf_layout (layout model ONNX ben trong pymupdf4llm) co the throw
 "[ONNXRuntimeError]: Unexpected input data type. Actual: (tensor(int32)),
 expected: (tensor(int64))" tren mot so CPU/OS/version combo. Day KHONG phai
-loi cua file PDF -- file van doc duoc bang fitz thuan. _load_pdf_documents()
-tu dong thu _fitz_fallback_text() (fitz.get_text) khi gap loi nay, nen cac
-PDF bi ONNX error van duoc dua vao testset thay vi bi bo qua im lang.
+loi cua file PDF -- file van doc duoc bang fitz thuan. pdf_to_marked_markdown()
+(import tu build_vectordb.py) DA TU XU LY loi ONNX nay o BEN TRONG worker
+subprocess cua no (retry voi use_layout(False)) va co timeout cung
+(PDF_TIMEOUT_SECONDS) de 1 PDF treo khong lam ket ca batch.
+
+Script nay them 1 lop fallback fitz THUAN o NGOAI, chi kich hoat khi
+pdf_to_marked_markdown() van tra ve rong sau ca 2 lan thu noi bo (vi du:
+timeout, hoac loi khac ONNX). fitz.get_text() KHONG tao heading Markdown
+(khong co dong "## ..."), nen voi PDF roi vao nhanh nay:
+  - split_into_sections() se KHONG tach duoc section nao (toan bo van ban
+    nam trong 1 section duy nhat, heading=None)
+  - _is_reference_heading() do do KHONG BAO GIO khop (khong co heading de
+    so khop) -- toan bo section "References" cua PDF do se KHONG bi loai
+    o tang heading-level nua
+  - Chi con _looks_like_reference_chunk() (tang chunk-level, dua tren mat
+    do citation-marker/multi-author/journal-cite trong tung chunk rieng le)
+    con hieu luc loc reference cho PDF nay
+Day la suy giam co chu y, KHONG phai bug: van tot hon truoc day (0% duoc
+loc), va script IN CANH BAO RO RANG moi khi 1 PDF roi vao nhanh nay, kem ten
+file, de nguoi doc log biet ngay heading-based filtering da mat hieu luc
+cho PDF do va co the kiem tra thu cong neu can.
 
 Chi index cac PDF khop ALLOWED_PDF_FILENAMES (import truc tiep tu
 scripts/build_vectordb.py, khong copy lai) -- cung allow-list dang dung de
@@ -80,11 +125,17 @@ Chay:
     --docs_dir   services/orchestrator/rag/docs \\
     --out_file   eval/results/ragas_testset.json \\
     --n_samples  50 --rpm 30
+
+  # Dung embedding model khac voi mac dinh build_vectordb.py (vi du dang
+  # thu nghiem 1 checkpoint moi va muon testset khop tokenizer cua no):
+  python eval/generate_ragas_testset.py \\
+    --model models/checkpoints/embedding_model_finetuned_v2
 """
 import argparse
 import asyncio
 import glob
 import os
+import random
 import re
 import sys
 from pathlib import Path
@@ -104,11 +155,31 @@ from pathlib import Path
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-# Dung chung allow-list va logic gan organ voi scripts/build_vectordb.py, thay
-# vi duy tri 2 ban sao co the lech pha nhau. parents[1] la project root vi
-# file nay nam o eval/, giong pattern da dung trong eval/eval_rag.py.
+# Dung chung pipeline tien xu ly voi scripts/build_vectordb.py, thay vi duy
+# tri 2 ban sao co the lech pha nhau:
+#   - ALLOWED_PDF_FILENAMES, _detect_organ: chon PDF + gan organ
+#   - pdf_to_marked_markdown: PDF -> markdown co <!--page:N--> marker,
+#     chay trong subprocess rieng voi timeout, tu retry use_layout(False)
+#     khi gap loi ONNX int32/int64
+#   - split_into_sections: tach markdown thanh cac section theo heading H1-H4
+#   - _is_reference_heading: loai section co heading la "References"/...
+#   - chunk_section: cat 1 section thanh cac chunk theo token (dung
+#     embedder.tokenizer THAT, khong phai tiktoken), strip page-marker/
+#     picture-text-marker/<br> khoi chunk text
+#   - _looks_like_reference_chunk: loai chunk MOSTLY la citation list con
+#     sot lai trong 1 section noi dung binh thuong
+# parents[1] la project root vi file nay nam o eval/, giong pattern da dung
+# trong eval/eval_rag.py.
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from scripts.build_vectordb import ALLOWED_PDF_FILENAMES, _detect_organ
+from scripts.build_vectordb import (
+    ALLOWED_PDF_FILENAMES,
+    _detect_organ,
+    _is_reference_heading,
+    _looks_like_reference_chunk,
+    chunk_section,
+    pdf_to_marked_markdown,
+    split_into_sections,
+)
 
 # Script nay chay standalone, .env khong tu doc nhu trong container.
 # Phai load o day, neu khong cac bien GOOGLE_API_KEY/OPENAI_API_KEY se rong.
@@ -118,12 +189,28 @@ load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 def _fitz_fallback_text(pdf_path: str) -> str:
     """
-    Fallback: doc toan bo text tu PDF bang fitz thuan tuy (khong qua
-    ONNX layout model cua pymupdf_layout). Dung khi pymupdf4llm.to_markdown()
-    that bai voi loi ONNX (vi du: Unexpected input data type int32 vs int64).
+    Fallback NGOAI CUNG: doc toan bo text tu PDF bang fitz thuan tuy
+    (khong qua ONNX layout model, khong qua ca hai lan retry noi bo cua
+    pdf_to_marked_markdown()). Chi duoc goi khi pdf_to_marked_markdown()
+    da tra ve rong (vi du: PDF_TIMEOUT_SECONDS timeout, hoac 1 loi khac
+    voi loi ONNX int32/int64 ma retry noi bo khong xu ly duoc).
 
-    Moi trang duoc noi vao chuoi ket qua voi page marker <!-- page:N --> de
-    giu nhat quan voi format build_vectordb.py.
+    CANH BAO QUAN TRONG: fitz.get_text("text") KHONG tao heading Markdown
+    ("## ..."). Voi PDF doc qua nhanh nay, split_into_sections() o buoc
+    sau se KHONG the tach section nao ca -- toan bo noi dung PDF roi vao
+    dung 1 section voi heading=None. He qua truc tiep:
+      - _is_reference_heading() khong co gi de so khop -> section
+        "References"/"Bibliography" cua PDF nay se KHONG bi loai o tang
+        heading-level nua.
+      - Chi con _looks_like_reference_chunk() (tang chunk-level, dua vao
+        mat do citation-marker trong tung chunk rieng le) tiep tuc loc
+        duoc phan nao, nhung se BO SOT nhieu citation hon so voi PDF doc
+        thanh cong qua pymupdf4llm.
+
+    Moi trang duoc noi vao chuoi ket qua voi page marker <!--page:N--> de
+    giu nhat quan voi format cua pdf_to_marked_markdown() trong
+    build_vectordb.py (can cho _extract_page_range-style logic o cac noi
+    khac dung chung PAGE_MARKER_RE).
     """
     import fitz  # PyMuPDF
 
@@ -136,21 +223,52 @@ def _fitz_fallback_text(pdf_path: str) -> str:
     doc.close()
     return "\n\n".join(parts)
 
-# Thong so chunk giong build_vectordb.py: 200 tokens moi chunk, 30 overlap.
-# RAGAS HeadlineSplitter noi bo chi hoat dong tot voi doc ngan (<500 token).
-# Voi PDF y khoa nhieu trang (fallback fitz khong co heading), no tao 1 chunk
-# khong lo khien adjust_chunks() bi loop rat lau (pseudo-infinite).
-# Giai phap: chunk truoc bang RecursiveCharacterTextSplitter truoc khi dua vao
-# RAGAS, roi dung generate_with_chunks() thay vi generate_with_langchain_docs()
-# de RAGAS biet day la chunks, dung default_transforms_for_prechunked() (bo qua
-# HeadlinesExtractor + HeadlineSplitter hoan toan).
-_CHUNK_TOKENS = 200
-_CHUNK_OVERLAP_TOKENS = 30
+
+def _pdf_to_markdown_with_fallback(pdf_path: str) -> tuple:
+    """
+    Goi pdf_to_marked_markdown() (co timeout + retry ONNX noi bo, xem
+    build_vectordb.py). Neu no van tra ve rong, thu fallback fitz thuan
+    o day.
+
+    Tra ve (markdown_text, used_fitz_fallback: bool). Cai thu 2 duoc dung
+    o cap tren de in canh bao ro rang khi heading-based reference filtering
+    mat hieu luc cho file nay (xem docstring _fitz_fallback_text).
+    """
+    filename = os.path.basename(pdf_path)
+    text = pdf_to_marked_markdown(pdf_path)
+    if text.strip():
+        return text, False
+
+    print(f"  [warn] pdf_to_marked_markdown() khong doc duoc {filename} "
+          f"(timeout hoac loi) -- thu fallback fitz thuan...")
+    try:
+        text = _fitz_fallback_text(pdf_path)
+    except Exception as e2:
+        print(f"  [warn] Fallback fitz cung that bai voi {filename}: {e2} -- bo qua.")
+        return "", False
+
+    if not text.strip():
+        print(f"  [warn] Fallback fitz: {filename} khong co noi dung -- bo qua.")
+        return "", False
+
+    print(
+        f"  [info] Fallback fitz thanh cong: {filename}. "
+        f"[CANH BAO] PDF nay KHONG co heading Markdown tu fitz thuan, nen "
+        f"split_into_sections() se coi toan bo la 1 section (heading=None) "
+        f"va bo loc heading-level cho section References/Bibliography SE "
+        f"KHONG hoat dong voi file nay -- chi con bo loc chunk-level "
+        f"(_looks_like_reference_chunk) con hieu luc. Kiem tra thu cong "
+        f"testset sinh ra tu {filename} neu can chac chan khong con sot "
+        f"citation list."
+    )
+    return text, True
+
 
 # Cap so chunk de kiem soat so LLM call trong SummaryExtractor.
 # RAGAS goi 1 LLM request cho moi chunk (SummaryExtractor) truoc khi generate.
-# Voi 13k+ chunks (icd10cm 7479 + breast ultrasound 4382), SummaryExtractor
-# ton ~7 gio o 30 RPM. Cap per-file + total giu runtime o muc chap nhan duoc:
+# Voi PDF lon (vi du sach giao khoa Breast Ultrasound nhieu tram trang),
+# so chunk co the len toi hang nghin. Cap per-file + total giu runtime o
+# muc chap nhan duoc:
 #   300 chunks x (1/30 RPM) = 10 phut cho SummaryExtractor o 30 RPM
 #   300 chunks x (1/60 RPM) = 5 phut o 60 RPM
 # Sampling ngau nhien (random.sample) trong moi file de tranh lay toan bo
@@ -158,60 +276,97 @@ _CHUNK_OVERLAP_TOKENS = 30
 _MAX_CHUNKS_PER_FILE = 50    # sample toi da 50 chunks moi PDF
 _MAX_CHUNKS_TOTAL = 300      # cap tong so chunks dua vao RAGAS
 
+# Thong so chunk mac dinh giong build_vectordb.py: 200 tokens moi chunk,
+# 30 overlap -- dung lam gia tri --chunk_tokens/--overlap_tokens mac dinh
+# de testset phan anh dung granularity FAISS index thuc te (tru khi nguoi
+# dung chu dong doi bang CLI flag).
+_CHUNK_TOKENS = 200
+_CHUNK_OVERLAP_TOKENS = 30
+
 # RAGAS multi-hop synthesizer chen prefix nay vao dau moi context trong
 # reference_contexts; chunk goc khong co prefix nay nen phai cat truoc khi
 # so khop organ (xem _organ_from_ref_contexts trong main()).
 _HOP_PREFIX_RE = re.compile(r"^<\d+-hop>\s*")
 
 
-def _chunk_text_to_documents(text: str, filename: str, chunk_tokens: int,
-                              overlap_tokens: int, max_per_file: int) -> list:
+def _pdf_to_documents(
+    pdf_path: str,
+    embedder,
+    chunk_tokens: int,
+    overlap_tokens: int,
+    max_per_file: int,
+) -> list:
     """
-    Cat text cua 1 PDF thanh cac LangChain Document nho dung
-    RecursiveCharacterTextSplitter voi length_function dem token (tiktoken
-    cl100k_base, giong HeadlineSplitter cua RAGAS dung noi bo).
+    Chuyen 1 PDF thanh list LangChain Document, dung DUNG pipeline tien xu
+    ly cua build_vectordb.py (page-marker markdown -> tach heading -> loc
+    section References -> chunk theo token cua embedder that -> loc chunk
+    citation-list con sot) thay vi tu chunk phang toan bo van ban.
 
-    Neu so chunk vuot max_per_file, lay mau ngau nhien (random.sample) phan bo
-    deu tren toan bo tai lieu thay vi chi lay phan dau -- tranh bias theo trang.
+    Neu so chunk hop le vuot max_per_file, lay mau ngau nhien (random.sample)
+    phan bo deu tren toan bo tai lieu thay vi chi lay phan dau -- tranh bias
+    theo trang, giong logic cap cu.
 
-    Dung cung thong so chunk_tokens/overlap_tokens voi build_vectordb.py
-    de dam bao testset duoc sinh tu cung granularity voi FAISS index thuc te.
-    Metadata 'source' va 'organ' duoc copy sang tat ca chunk cua PDF do.
+    Metadata moi Document gom:
+      - source: ten file PDF (dung "source" de tuong thich nguoc voi cho
+        nao trong pipeline dang doc key nay)
+      - organ: tu _detect_organ(filename), giong build_vectordb.py
+      - section_heading, page_number: giu lai tu metadata that cua
+        build_vectordb.py (huu ich khi debug testset, khong bat buoc RAGAS
+        dung toi)
     """
-    import random
-    import tiktoken
-    from langchain_core.documents import Document
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-    enc = tiktoken.get_encoding("cl100k_base")
-
-    def _token_len(s: str) -> int:
-        return len(enc.encode(s))
-
-    splitter = RecursiveCharacterTextSplitter(
-        chunk_size=chunk_tokens,
-        chunk_overlap=overlap_tokens,
-        length_function=_token_len,
-        separators=["\n\n", "\n", ". ", " ", ""],
-    )
+    filename = os.path.basename(pdf_path)
     organ = _detect_organ(filename)
-    raw_chunks = [c for c in splitter.split_text(text) if c.strip()]
 
-    # Sample ngau nhien neu vuot cap de tranh bias theo vi tri trong tai lieu
-    if len(raw_chunks) > max_per_file:
-        raw_chunks = random.sample(raw_chunks, max_per_file)
+    marked_markdown, used_fitz_fallback = _pdf_to_markdown_with_fallback(pdf_path)
+    if not marked_markdown.strip():
+        return []
 
-    return [
-        Document(
-            page_content=chunk,
-            metadata={"source": filename, "organ": organ},
+    sections = split_into_sections(marked_markdown)
+
+    from langchain_core.documents import Document
+
+    docs = []
+    n_sections_dropped = 0
+    n_chunks_dropped = 0
+    for section in sections:
+        if _is_reference_heading(section["heading"]):
+            n_sections_dropped += 1
+            continue
+
+        section_chunks = chunk_section(section["text"], embedder, chunk_tokens, overlap_tokens)
+        for _raw_chunk, clean_text in section_chunks:
+            if _looks_like_reference_chunk(clean_text):
+                n_chunks_dropped += 1
+                continue
+            docs.append(
+                Document(
+                    page_content=clean_text,
+                    metadata={
+                        "source": filename,
+                        "organ": organ,
+                        "section_heading": section["heading"],
+                    },
+                )
+            )
+
+    if n_sections_dropped or n_chunks_dropped:
+        print(
+            f"    [ref-filter] {filename}: dropped {n_sections_dropped} "
+            f"reference-heading section(s), {n_chunks_dropped} citation-like "
+            f"chunk(s)"
+            + (" [gioi han: chi chunk-level filter co hieu luc do fallback fitz]"
+               if used_fitz_fallback else "")
         )
-        for chunk in raw_chunks
-    ]
+
+    if len(docs) > max_per_file:
+        docs = random.sample(docs, max_per_file)
+
+    return docs
 
 
 def _load_pdf_documents(
     docs_dir: str,
+    embedder,
     chunk_tokens: int = _CHUNK_TOKENS,
     overlap_tokens: int = _CHUNK_OVERLAP_TOKENS,
     max_chunks_per_file: int = _MAX_CHUNKS_PER_FILE,
@@ -219,22 +374,17 @@ def _load_pdf_documents(
 ) -> list:
     """
     Doc toan bo PDF trong docs_dir khop ALLOWED_PDF_FILENAMES (xem
-    scripts/build_vectordb.py), tra ve list LangChain Document da chunk san,
-    co cap so luong de kiem soat runtime cua RAGAS SummaryExtractor.
+    scripts/build_vectordb.py), tra ve list LangChain Document da chunk
+    dung PHIEN BAN GIONG HET pipeline production (heading-split + loc
+    reference 2 tang + token-chunk bang embedder that), co cap so luong
+    de kiem soat runtime cua RAGAS SummaryExtractor.
 
     Dung chung allow-list voi scripts/build_vectordb.py de testset sinh ra
     tu dung cung tap PDF da duoc index vao FAISS -- PDF dang bang tra cuu ma
     benh (ICD-10) khong nam trong allow-list vi khong phai van ban lam sang
     dien giai, xem ly do chi tiet trong docstring ALLOWED_PDF_FILENAMES.
 
-    Moi PDF duoc:
-    1. Chuyen sang text qua pymupdf4llm.to_markdown() (giu heading/bang).
-    2. Neu (1) that bai voi loi ONNX int32/int64, thu _fitz_fallback_text().
-    3. Cat thanh chunks bang _chunk_text_to_documents() (200 token, 30 overlap).
-    4. Cap toi da max_chunks_per_file chunk moi PDF (sample ngau nhien).
-    5. Cap tong toi da max_chunks_total (shuffle + slice de phan bo deu).
-
-    Ly do cap:
+    Ly do cap max_chunks_*:
     SummaryExtractor cua RAGAS goi 1 LLM request cho moi chunk. max_chunks_total
     gioi han tong so LLM call du so PDF trong allow-list la bao nhieu, giu
     runtime o muc du doan duoc (vi du 300 chunks x 2s/req ~ 10-15 phut o 30 RPM).
@@ -245,62 +395,60 @@ def _load_pdf_documents(
     default_transforms_for_prechunked() bo qua hoan toan HeadlinesExtractor +
     HeadlineSplitter.
     """
-    import random
-    import pymupdf4llm
-
-    ONNX_DTYPE_ERRMSG = "Unexpected input data type"
-
     all_found = sorted(glob.glob(os.path.join(docs_dir, "**/*.pdf"), recursive=True))
     allowed_lower = {n.lower() for n in ALLOWED_PDF_FILENAMES}
     pdf_files = [p for p in all_found if os.path.basename(p).lower() in allowed_lower]
     for p in sorted(set(all_found) - set(pdf_files)):
         print(f"  [SKIP] {os.path.basename(p)} not in ALLOWED_PDF_FILENAMES -- not used for testset.")
 
-    all_chunks: list = []
+    all_docs: list = []
 
     for pdf_path in pdf_files:
         filename = os.path.basename(pdf_path)
-        text = None
+        print(f"  Processing: {filename}")
         try:
-            text = pymupdf4llm.to_markdown(pdf_path)
+            docs = _pdf_to_documents(
+                pdf_path, embedder, chunk_tokens, overlap_tokens, max_chunks_per_file
+            )
         except Exception as e:
-            if ONNX_DTYPE_ERRMSG in str(e):
-                print(f"  [warn] pymupdf4llm ONNX error voi {filename} -- thu fallback fitz thuan...")
-                try:
-                    text = _fitz_fallback_text(pdf_path)
-                    if text and text.strip():
-                        print(f"  [info] Fallback fitz thanh cong: {filename}")
-                    else:
-                        print(f"  [warn] Fallback fitz: {filename} khong co noi dung -- bo qua.")
-                        continue
-                except Exception as e2:
-                    print(f"  [warn] Fallback fitz cung that bai voi {filename}: {e2} -- bo qua.")
-                    continue
-            else:
-                print(f"  [warn] Khong doc duoc {filename}: {e} -- bo qua.")
-                continue
-
-        if not text or not text.strip():
-            print(f"  [warn] {filename} khong co noi dung trich xuat duoc -- bo qua.")
+            print(f"  [warn] Unexpected error processing {filename}: {e} -- bo qua.")
             continue
 
-        chunks = _chunk_text_to_documents(text, filename, chunk_tokens, overlap_tokens,
-                                          max_chunks_per_file)
-        if not chunks:
+        if not docs:
             print(f"  [warn] {filename} sau khi chunk khong co doan nao -- bo qua.")
             continue
 
-        all_chunks.extend(chunks)
+        all_docs.extend(docs)
         organ = _detect_organ(filename)
-        print(f"  [info] {filename}: lay {len(chunks)} chunks (organ={organ})")
+        print(f"    -> {len(docs)} chunks (organ={organ})")
 
     # Cap tong: shuffle de phan bo deu cac file, sau do slice
-    if len(all_chunks) > max_chunks_total:
-        random.shuffle(all_chunks)
-        all_chunks = all_chunks[:max_chunks_total]
+    if len(all_docs) > max_chunks_total:
+        random.shuffle(all_docs)
+        all_docs = all_docs[:max_chunks_total]
         print(f"  [info] Cap tong: giu {max_chunks_total} chunks (shuffle ngau nhien)")
 
-    return all_chunks
+    return all_docs
+
+
+def _load_embedder(model_path: str):
+    """
+    Load CUNG mot embedding model (kien truc + tokenizer) voi
+    build_vectordb.py, chi de lay .tokenizer dung cho chunk_section().
+
+    Day KHONG phai buoc tao embedding cho RAGAS -- embedding cho RAGAS
+    (dung de xay knowledge graph / chon cau hoi) van do
+    GoogleGenerativeAIEmbeddings hoac OpenAIEmbeddings dam nhiem rieng o
+    _get_testset_llm_embeddings(). Load model o day chi nham muc dich
+    dung DUNG tokenizer ma production dung de quyet dinh do dai 200-token
+    cua moi chunk, thay vi tiktoken cl100k_base (tokenizer khac, cho token
+    count khac, se lam testset khong con phan anh dung granularity chunk
+    thuc te trong FAISS index).
+    """
+    from sentence_transformers import SentenceTransformer
+
+    print(f"[embedder] Loading tokenizer tu {model_path} (dung de chunk giong build_vectordb.py)...")
+    return SentenceTransformer(model_path)
 
 
 def _get_testset_llm_embeddings(rpm: int):
@@ -370,14 +518,37 @@ def _get_testset_llm_embeddings(rpm: int):
         # TRONG coroutine dang chay tren loop hien tai -- khong bi "mang theo"
         # tu loop cu sang loop moi. Bo tham so nay di la cach don gian nhat
         # de moi asyncio.run() co client rieng, khop dung voi loop cua no.
+        #
+        # NHUNG: tren thuc te (xac nhan qua traceback that tren Windows +
+        # openai SDK ban moi), ChatOpenAI/AsyncOpenAI van cache 1
+        # httpx.AsyncClient o CAP INSTANCE (self.root_async_client), khong
+        # lazy-tao lai moi request nhu gia dinh o tren -- nen client tao ra
+        # o transform dau tien (vi du EmbeddingExtractor/ThemesExtractor)
+        # van bi "mang sang" asyncio.run() cua transform SAU (NERExtractor),
+        # noi loop cu da dong -> aclose() nem "RuntimeError: Event loop is
+        # closed" khi httpcore don connection, loi nay bi wrap thanh
+        # openai.APIConnectionError roi RAGAS in ra "Task failed with
+        # APIConnectionError: Connection error." Khong truyen
+        # http_async_client KHONG du de tranh van de nay tren moi SDK.
+        #
+        # max_retries=6 (langchain_openai truyen xuong OpenAI SDK, dung
+        # exponential backoff noi bo cua SDK) la lop phong thu thuc te: khi
+        # 1 request chet vi client cu gan voi loop da dong, SDK retry se
+        # thu lai va thuong thanh cong ngay o lan ke tiep (luc do da dang
+        # chay on dinh trong loop hien tai). Day KHONG phai fix goc cho bug
+        # cache-client noi tren, nhung tranh duoc viec 1 loi thoang qua lam
+        # sap ca lan generate testset (thuong chay hang chuc phut).
         generator_llm = ChatOpenAI(
             model=openai_model,
             api_key=openai_api_key,
             temperature=1,           # gia tri mac dinh; bypass_temperature se skip viec RAGAS ghi de
             rate_limiter=rate_limiter,
+            max_retries=6,           # chong "Event loop is closed" / connection error thoang qua, xem giai thich tren
         )
         embeddings = OpenAIEmbeddings(
-            model="text-embedding-3-small", api_key=openai_api_key,
+            model="text-embedding-3-small",
+            api_key=openai_api_key,
+            max_retries=6,
         )
         return generator_llm, embeddings, True   # bypass_temperature=True
 
@@ -402,6 +573,9 @@ def _get_testset_llm_embeddings(rpm: int):
 
 
 def main(docs_dir: str, out_file: str, n_samples: int, rpm: int,
+         model_path: str,
+         chunk_tokens: int = _CHUNK_TOKENS,
+         overlap_tokens: int = _CHUNK_OVERLAP_TOKENS,
          max_chunks_per_file: int = _MAX_CHUNKS_PER_FILE,
          max_chunks_total: int = _MAX_CHUNKS_TOTAL):
     import warnings
@@ -410,8 +584,13 @@ def main(docs_dir: str, out_file: str, n_samples: int, rpm: int,
     from ragas.testset import TestsetGenerator
     from ragas.testset.graph import KnowledgeGraph
 
+    embedder = _load_embedder(model_path)
+
     chunks = _load_pdf_documents(
         docs_dir,
+        embedder,
+        chunk_tokens=chunk_tokens,
+        overlap_tokens=overlap_tokens,
         max_chunks_per_file=max_chunks_per_file,
         max_chunks_total=max_chunks_total,
     )
@@ -505,6 +684,21 @@ if __name__ == "__main__":
     p.add_argument("--out_file", default="eval/results/ragas_testset.json")
     p.add_argument("--n_samples", type=int, default=50)
     p.add_argument(
+        "--model",
+        default="models/checkpoints/embedding_model_finetuned_final",
+        help=(
+            "Embedding model dung de lay tokenizer khi chunk (--chunk_tokens/"
+            "--overlap_tokens duoc dem bang tokenizer cua model nay, giong "
+            "het build_vectordb.py --model). Mac dinh trung voi build_vectordb.py "
+            "de granularity chunk khop chinh xac voi FAISS index thuc te. "
+            "KHONG dung de tao embedding cho RAGAS -- chi de lay .tokenizer."
+        ),
+    )
+    p.add_argument("--chunk_tokens", type=int, default=_CHUNK_TOKENS,
+                    help=f"So token moi chunk (mac dinh {_CHUNK_TOKENS}, giong build_vectordb.py).")
+    p.add_argument("--overlap_tokens", type=int, default=_CHUNK_OVERLAP_TOKENS,
+                    help=f"So token overlap giua 2 chunk lien tiep (mac dinh {_CHUNK_OVERLAP_TOKENS}).")
+    p.add_argument(
         "--rpm",
         type=int,
         default=8,
@@ -536,5 +730,8 @@ if __name__ == "__main__":
     )
     args = p.parse_args()
     main(args.docs_dir, args.out_file, args.n_samples, args.rpm,
+         model_path=args.model,
+         chunk_tokens=args.chunk_tokens,
+         overlap_tokens=args.overlap_tokens,
          max_chunks_per_file=args.max_chunks_per_file,
          max_chunks_total=args.max_chunks_total)

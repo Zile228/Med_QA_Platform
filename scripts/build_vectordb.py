@@ -48,6 +48,147 @@ _MP_SPAWN_CTX = mp.get_context("spawn")
 
 PAGE_MARKER_RE = re.compile(r"<!--page:(\d+)-->")
 
+# --- Reference/bibliography filtering -----------------------------------
+# Clinical guideline PDFs (ATA, ACR TI-RADS, BI-RADS, ESR eBook) end with a
+# References/Bibliography section: dozens of numbered citation lines like
+# "82. Jeh SK, Jung SL, Kim BS, Lee YS 2007 Evaluating the degree of...".
+# Nothing in the original pipeline filtered these out, so they get chunked
+# and embedded exactly like clinical content. Their embeddings often score
+# well against short lexicon-style queries (they're dense in medical terms:
+# "thyroid", "malignant", "ultrasound"...) so they get retrieved, but they
+# carry no clinical claim the LLM's answer could be faithful to -- this
+# was confirmed directly in ragas_pipeline.csv, where several retrieved
+# chunks are exactly this kind of citation list.
+#
+# Two independent filters, applied at different granularities:
+#   1. Heading-level: if a section's own heading is "References"/
+#      "Bibliography"/etc., drop the whole section before chunking.
+#   2. Chunk-level: reference lists don't always sit under their own
+#      heading (e.g. squeezed at the end of a content section by the
+#      page/heading splitter). If a chunk is MOSTLY numbered citation
+#      lines, drop that chunk even though its section heading looked fine.
+REFERENCE_HEADING_RE = re.compile(
+    r"^(references?|bibliography|works cited|literature cited)$",
+    re.IGNORECASE,
+)
+
+# pymupdf4llm renders PDF hyperlinks as markdown links; a citation's author
+# names can end up split across "[...]"/"(url)" boundaries. Strip link
+# syntax (keep the visible text) before pattern-matching so a wrapped
+# citation like "[Lacout A, Chevenet C, Marcy PY. ...](url)" is still
+# recognized as author names, not hidden behind bracket/URL noise.
+#
+# The URL group tolerates ONE level of nested parens, e.g.
+# "http://refhub.elsevier.com/S1546-1440(17)30186-2/sref65" -- publisher
+# refhub URLs commonly embed "(17)"-style volume/year fragments in
+# parens. A naive "[^)]*" stops at that inner ')' and leaves a URL
+# fragment ("30186-2/sref65)") glued onto the visible text, which both
+# corrupts the citation text AND silently shortens the match so
+# len(joined) undercounts -- this is what let the "65. Ahuja AT..." chunk
+# slip through at len=140 instead of its true ~180 chars.
+_MD_LINK_RE = re.compile(r"\[([^\]]*)\]\(((?:[^()]|\([^()]*\))*)\)")
+
+# "82. Jeh SK, Jung SL" / "31. Lacout A, Chevenet C, Marcy PY." -- a
+# numbered marker directly followed by a Surname + 1-3 capital initials is
+# the distinctive shape of a reference-list entry start.
+_CITATION_MARKER_RE = re.compile(r"(?:^|\s)\[?\d{1,3}\]?[.)]\s+[A-Z][a-zA-Z\-]+\s[A-Z]{1,3}[,. ]")
+
+# "Author AB, Author CD, Author EF" or "Author AB et al" -- a run of 2+
+# comma/"et al"-joined Surname+Initials blocks. This is the structural
+# signature of a bibliographic author list and essentially never occurs
+# in clinical prose, even prose that names one study's authors inline.
+_MULTI_AUTHOR_RUN_RE = re.compile(
+    r"([A-Z][a-zA-Z\-]+\s[A-Z]{1,3}(,\s*|\set al\.?\s*))+[A-Z][a-zA-Z\-]+\s[A-Z]{1,3}"
+)
+
+# Second citation style seen in book-format PDFs (e.g. the Breast
+# Ultrasound textbook), distinct from the numbered-journal style above:
+# "Burnett SJ, et al. Benign biopsies... _Clin Radiol_ 1995;50(4):254-258."
+# No leading number, single-initial-block name directly followed by
+# "et al.", often wrapped in markdown emphasis around the journal name.
+_ETAL_CITATION_RE = re.compile(r"\b[A-Z][a-zA-Z\-]+\s[A-Z]{1,3},?\s+et al\.")
+# "Year;vol(issue):pages" -- e.g. "1995;50(4):254-258" -- the journal
+# citation shape used by this same book-style reference list. Distinct
+# from a bare "in 2015" mention: requires the semicolon+volume+colon+page
+# structure, which body prose does not produce. Tolerates one stray space
+# after the colon (":\s?\d"), since a markdown-link boundary commonly
+# splits a citation right there (observed real example: "J Ultrasound Med
+# 2016;35: 1-11." where "1-11." was link text and the space before it
+# survived the link-stripping step).
+#
+# Deliberately NOT matched: a numbered-list marker followed by an
+# all-caps acronym (e.g. "64. AIUM practice parameter..."). That pattern
+# was tried and dropped -- it false-positives on ordinary numbered
+# clinical guideline steps ("2. FNA is recommended for nodules with high
+# suspicion features...", "3. ACR guidelines recommend biopsy..."), which
+# are exactly the content this filter must never remove. The
+# whitespace-tolerant journal-cite pattern above is what actually catches
+# organization-authored reference entries like the AIUM one, via their
+# journal-citation tail rather than their acronym "author" head.
+_JOURNAL_CITE_RE = re.compile(r"\b(?:19|20)\d{2};\d+(?:\(\d+\))?:\s?\d+")
+
+_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}\b")
+
+# Density threshold (score per 200 chars) above which a chunk is treated as
+# a reference list. Validated against real chunks pulled from
+# eval/results/ragas_pipeline.csv (both flagged) plus clinical prose chunks
+# containing an inline citation or several study years (both spared) --
+# see the accompanying eval writeup for the exact test cases.
+_REFERENCE_DENSITY_THRESHOLD = 2.0
+# NOTE: originally 150. Real leaked chunks (e.g. a single splitter-isolated
+# citation like "65. Ahuja AT, Ying M, Ho SY, et al. Ultrasound of
+# malignant cervical lymph nodes. Cancer Imaging 2008;8:48-56.") are only
+# ~140-180 chars -- RecursiveCharacterTextSplitter's chunk_overlap boundary
+# regularly isolates exactly one citation into its own chunk. A 150-char
+# floor silently exempted this entire class of chunk from the density
+# check below, which is why 43/252 retrieved contexts in the post-filter
+# pipeline eval were still citation noise. The n_structural>=2 gate (two
+# independent numbered-marker/multi-author hits) is what actually protects
+# short clinical prose from false positives, not chunk length, so the
+# floor only needs to be long enough to contain two such hits at all.
+_REFERENCE_CHUNK_MIN_CHARS = 40
+
+
+def _is_reference_heading(heading) -> bool:
+    if not heading:
+        return False
+    return bool(REFERENCE_HEADING_RE.match(heading.strip()))
+
+
+def _looks_like_reference_chunk(text: str) -> bool:
+    """
+    Heuristic chunk-level filter for citation lists that end up inside an
+    otherwise legitimate section (see module comment above). Requires at
+    least one structural signal (a numbered citation marker or a
+    multi-author run) before counting bare year mentions -- clinical prose
+    routinely cites study years ("a 2015 ATA guideline update...") without
+    that making it a reference list, so years alone must never trip this.
+    """
+    joined = _MD_LINK_RE.sub(r"\1", text)
+    joined = re.sub(r"\s+", " ", joined).strip()
+    if len(joined) < _REFERENCE_CHUNK_MIN_CHARS:
+        return False
+
+    n_markers = len(_CITATION_MARKER_RE.findall(joined))
+    n_multi_author = len(_MULTI_AUTHOR_RUN_RE.findall(joined))
+    n_etal = len(_ETAL_CITATION_RE.findall(joined))
+    n_journal_cite = len(_JOURNAL_CITE_RE.findall(joined))
+    n_years = len(_YEAR_RE.findall(joined))
+
+    # A single inline citation ("Author AB, Author CD 2005 showed that...")
+    # is normal in one-sentence clinical prose and must not trip this on
+    # its own -- require at least 2 structural hits (numbered markers,
+    # multi-author runs, "Surname AB, et al." mentions, and
+    # "Year;vol(issue):pages" journal citations, counted together) before
+    # treating the chunk as a reference list at all.
+    n_structural = n_markers + n_multi_author + n_etal + n_journal_cite
+    if n_structural < 2:
+        return False
+
+    score = n_markers * 2 + n_multi_author * 2 + n_etal * 2 + n_journal_cite * 2 + n_years
+    density = score / (len(joined) / 200)
+    return density >= _REFERENCE_DENSITY_THRESHOLD
+
 # Allow-list of indexable PDF filenames (case-insensitive, exact basename
 # match). See the module docstring above for why this is an allow-list
 # rather than an exclude-list.
@@ -297,10 +438,22 @@ def process_pdf(pdf_path: str, embedder, chunk_tokens: int, overlap_tokens: int)
     chunks = []
     metadata = []
     carry_page = 1
+    n_sections_dropped = 0
+    n_chunks_dropped = 0
     for section in sections:
+        if _is_reference_heading(section["heading"]):
+            n_sections_dropped += 1
+            # Still need to advance carry_page past this section's pages so
+            # page numbers on the next real section stay correct.
+            _, _, carry_page = _extract_page_range(section["text"], carry_page)
+            continue
+
         section_chunks = chunk_section(section["text"], embedder, chunk_tokens, overlap_tokens)
         for raw_chunk, clean_text in section_chunks:
             page_start, page_end, carry_page = _extract_page_range(raw_chunk, carry_page)
+            if _looks_like_reference_chunk(clean_text):
+                n_chunks_dropped += 1
+                continue
             chunks.append(clean_text)
             metadata.append({
                 "source_file": filename,
@@ -309,6 +462,12 @@ def process_pdf(pdf_path: str, embedder, chunk_tokens: int, overlap_tokens: int)
                 "section_heading": section["heading"],
                 "organ": organ,
             })
+
+    if n_sections_dropped or n_chunks_dropped:
+        print(
+            f"    [ref-filter] dropped {n_sections_dropped} reference-heading "
+            f"section(s), {n_chunks_dropped} citation-like chunk(s)"
+        )
     return chunks, metadata
 
 

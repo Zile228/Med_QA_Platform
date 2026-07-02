@@ -144,6 +144,58 @@ def _get_ragas_llm_embeddings():
     return ragas_llm, ragas_embeddings
 
 
+def _rebuild_enriched_query(report: dict) -> str:
+    """
+    Tai tao lai enriched_query MA PIPELINE THUC SU DA DUNG de lay 3 chunk
+    cuoi cung (xem services/orchestrator/graph.py::make_second_rag_retrieval,
+    dong ~855-876). Ham nay CHI DOC LAI cac field da co san trong
+    report["tier_1_structured"] (duoc /analyze tra ve qua HTTP), KHONG goi
+    lai pipeline va KHONG sua bat ky file production nao.
+
+    Truoc ban vien, load_pipeline_outputs() hard-code user_input giong het
+    nhau cho ca 84 record ("Phan tich dac diem sieu am..."). RAGAS
+    answer_relevancy do cosine similarity giua cau hoi LLM tu sinh nguoc tu
+    response va user_input -- voi user_input khong lien quan gi den noi
+    dung response, diem nay gan nhu luon thap bat ke response tot hay te.
+    Day la nguyen nhan chinh khien answer_relevancy ~0.04 trong lan chay
+    truoc, khong phai do LLM sinh cau tra loi kem.
+
+    enriched_query THAT su dung 5 gia tri: top_label, organ, modality,
+    lexicon_terms (tu aspect_ratio_interpretation + circularity), icd10.
+    Tat ca 5 deu co san trong report["tier_1_structured"] voi CUNG TEN
+    field (Tier1Structured.label/organ/modality/icd10_hint/
+    aspect_ratio_interpretation/circularity -- xem shared/schemas.py), nen
+    co the tai tao chinh xac ma khong can pipeline luu them field moi nao.
+
+    Neu report thieu tier_1_structured (vi du output cu tu truoc khi field
+    nay ton tai), fallback ve placeholder cu de khong crash toan batch --
+    nhung in canh bao vi diem so cua record do se lai bi lech nhu truoc.
+    """
+    t1 = report.get("tier_1_structured") or {}
+    if not t1:
+        return None
+
+    top_label = t1.get("label", "") or ""
+    organ = t1.get("organ", "") or ""
+    modality = t1.get("modality", "ultrasound") or "ultrasound"
+    icd10 = t1.get("icd10_hint", "") or ""
+
+    lexicon_terms = []
+    aspect_ratio_interpretation = t1.get("aspect_ratio_interpretation")
+    if aspect_ratio_interpretation and aspect_ratio_interpretation != "intermediate":
+        lexicon_terms.append(aspect_ratio_interpretation)
+    circularity = t1.get("circularity")
+    if circularity is not None and circularity < 0.5:
+        lexicon_terms.append("irregular margin")
+    lexicon_text = " ".join(lexicon_terms)
+
+    enriched_query = f"{top_label} {organ} {modality} {lexicon_text} findings {icd10}".strip()
+    return " ".join(enriched_query.split())
+
+
+_FALLBACK_USER_INPUT = "Analyze the image and provide a radiological description and diagnostic suggestion."
+
+
 def load_pipeline_outputs(pipeline_dir: str) -> list:
     """
     Doc lai output da chay full pipeline (tu eval/run_pipeline_batch.py).
@@ -175,8 +227,18 @@ def load_pipeline_outputs(pipeline_dir: str) -> list:
                 "Faithfulness se khong co context de doi chieu."
             )
 
+        user_input = _rebuild_enriched_query(report)
+        if user_input is None:
+            print(
+                f"  [warn] {fp.name}: khong co tier_1_structured, dung fallback "
+                "user_input chung (answer_relevancy cua record nay se khong "
+                "dang tin cay -- chay lai run_pipeline_batch.py voi ban /analyze "
+                "moi de co tier_1_structured)."
+            )
+            user_input = _FALLBACK_USER_INPUT
+
         records.append({
-            "user_input": "Phan tich dac diem sieu am va dua ra nhan dinh lam sang.",
+            "user_input": user_input,
             "response": f"{tier2}\n\n{tier3}",
             "retrieved_contexts": [c for c in chunks[:3] if c],
             "_image_id": image_id,
