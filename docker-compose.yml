@@ -103,6 +103,7 @@ services:
       - ./services/orchestrator/rag/docs:/app/services/orchestrator/rag/docs:ro
       - ./services/orchestrator/rag/vectordb:/app/services/orchestrator/rag/vectordb
       - ./module_registry.yaml:/app/module_registry.yaml:ro
+      - ./models/checkpoints:/app/models/checkpoints:ro
     depends_on:
       - router
       - vision

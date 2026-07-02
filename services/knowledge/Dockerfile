@@ -7,8 +7,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements/knowledge.txt requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+COPY requirements/knowledge.txt ./requirements/knowledge.txt
+RUN pip install --no-cache-dir -r requirements/knowledge.txt
 
 COPY shared/ ./shared/
 COPY services/__init__.py ./services/__init__.py

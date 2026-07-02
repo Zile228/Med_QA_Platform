@@ -38,8 +38,8 @@ class FAISSStore:
         self,
         index_path: str = None,
         chunks_path: str = None,
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        embedding_model: str = "models/checkpoints/embedding_model_finetuned_final",
+        cross_encoder_model: str = "models/checkpoints/reranker_finetuned_final",
     ):
         self.index_path = index_path or os.getenv(
             "FAISS_INDEX_PATH",

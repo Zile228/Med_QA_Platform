@@ -85,7 +85,7 @@ def parse_args():
                    help="Target number of tokens per chunk")
     p.add_argument("--overlap_tokens", type=int, default=30,
                    help="Token overlap between consecutive chunks")
-    p.add_argument("--model", default="sentence-transformers/all-MiniLM-L6-v2",
+    p.add_argument("--model", default="models/checkpoints/embedding_model_finetuned_final",
                    help="Embedding model")
     return p.parse_args()
 
