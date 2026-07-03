@@ -1,6 +1,5 @@
 """
 services/knowledge/main.py
-===========================
 FastAPI Knowledge Service - Layer 3 | port 8003
 
 Endpoints:

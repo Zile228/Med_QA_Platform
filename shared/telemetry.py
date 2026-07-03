@@ -1,6 +1,6 @@
 """
 shared/telemetry.py
-====================
+
 Shared OpenTelemetry tracer initialization used by every service.
 
 Each service calls setup_tracing(service_name) exactly once on startup,

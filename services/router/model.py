@@ -1,19 +1,19 @@
 """
 services/router/model.py
-=========================
+
 Modality Router - EfficientNet-B0 classifier.
 
-Phân loại ảnh đầu vào vào 1 trong các modality:
+Classifies the input image into one of these modalities:
     - us_breast   (Breast Ultrasound)
     - us_thyroid  (Thyroid Ultrasound)
     - ood         (Out-of-distribution - reject)
 
-Phase 2: thêm xray class mà không sửa code, chỉ thêm class vào IDX_TO_CLASS.
+Phase 2: add an xray class without changing the code, only add it to IDX_TO_CLASS.
 
 Public API:
     load_router(checkpoint_path, device)   -> (model, transform)
     run_routing(model, transform, image_bytes, ood_threshold) -> dict
-        -> map 1-1 vào RoutingResult schema
+        -> maps 1-1 into the RoutingResult schema
 """
 
 import os
@@ -29,7 +29,7 @@ from PIL import Image
 from shared.image_validation import check_image_dimensions
 
 
-# Cau hinh cho router
+# Router configuration
 
 ROUTER_CLASSES = {
     0: "us_breast",
@@ -37,7 +37,7 @@ ROUTER_CLASSES = {
     }
 CLASS_TO_IDX = {v: k for k, v in ROUTER_CLASSES.items()}
 
-# Map module_key sang modality va organ
+# Maps module_key to modality and organ
 MODALITY_MAP = {
     "us_breast":  {"modality": "ultrasound", "organ": "breast"},
     "us_thyroid": {"modality": "ultrasound", "organ": "thyroid"},
@@ -54,22 +54,22 @@ MODULE_KEY_MAP = {
 
 OOD_THRESHOLD = float(os.getenv("OOD_THRESHOLD", "0.6"))
 
-# Trong so uu tien router khi ket hop voi user hint
+# Router priority weight when combined with the user hint
 ROUTER_HINT_ROUTER_WEIGHT = float(os.getenv("ROUTER_HINT_ROUTER_WEIGHT", "0.7"))
 
-# Map organ hint cua user sang module key
+# Maps the user's organ hint to a module key
 HINT_ORGAN_TO_MODULE_KEY = {
     "breast":  "us_breast",
     "thyroid": "us_thyroid",
 }
 
-# ImageNet mean/std (phu hop cho classify loai anh, khong phai anatomy)
+# ImageNet mean/std (suitable for classifying image type, not anatomy)
 MEAN = [0.485, 0.456, 0.406]
 STD  = [0.229, 0.224, 0.225]
 IMG_SIZE = 224   # EfficientNet-B0 native input
 
 
-# Kết hợp router confidence với user hint
+# Combines router confidence with the user hint
 
 def resolve_with_hint(
     router_probs: dict,
@@ -77,13 +77,13 @@ def resolve_with_hint(
     router_weight: float = ROUTER_HINT_ROUTER_WEIGHT,
 ) -> dict:
     """
-    Ket hop router_probs va user hint theo trong so tuyen tinh.
+    Combines router_probs and the user hint using a linear weighting.
 
     score(class) = router_weight * router_probs[class]
-                  + (1 - router_weight) * (1.0 neu class == hint else 0.0)
+                  + (1 - router_weight) * (1.0 if class == hint else 0.0)
 
-    hint_conflict phan anh hint co khac top-1 goc cua router khong,
-    doc lap voi ket qua cuoi cung.
+    hint_conflict reflects whether the hint differs from the router's
+    original top-1, independent of the final result.
     """
     router_top_key = max(router_probs, key=router_probs.get)
 
@@ -111,9 +111,9 @@ def resolve_with_hint(
         source = "router"
     else:
         note = (
-            f"Router dự đoán '{router_top_key}' (confidence {router_probs[router_top_key]:.0%}), "
-            f"user chọn hint '{hint_module_key}'. Kết hợp theo trọng số router_weight="
-            f"{router_weight} ra quyết định cuối '{final_key}'."
+            f"Router predicted '{router_top_key}' (confidence {router_probs[router_top_key]:.0%}), "
+            f"user selected hint '{hint_module_key}'. Combined using weight router_weight="
+            f"{router_weight} to reach the final decision '{final_key}'."
         )
         source = "user_hint" if final_key == hint_module_key else "weighted"
 
@@ -126,12 +126,12 @@ def resolve_with_hint(
     }
 
 
-# Dinh nghia model
+# Model definition
 
 class ModalityRouter(nn.Module):
     """
     EfficientNet-B0 + custom classifier head.
-    Lightweight - chỉ phân loại modality, không cần heavy backbone.
+    Lightweight - only classifies modality, doesn't need a heavy backbone.
     """
     def __init__(self, num_classes: int = 2):
         super().__init__()
@@ -140,7 +140,7 @@ class ModalityRouter(nn.Module):
             pretrained=False,
             num_classes=0,       # remove default head
         )
-        in_features = self.backbone.num_features   # 1280 với eff-b0
+        in_features = self.backbone.num_features   # 1280 for eff-b0
 
         self.classifier = nn.Sequential(
             nn.AdaptiveAvgPool2d(1),
@@ -156,7 +156,7 @@ class ModalityRouter(nn.Module):
         return self.classifier(feat)               # (B, num_classes)
 
 
-# Load model va transform
+# Load model and transform
 
 def build_transform() -> transforms.Compose:
     return transforms.Compose([
@@ -171,17 +171,17 @@ def load_router(
     device: str = None,
 ):
     """
-    Load ModalityRouter từ checkpoint.
+    Loads ModalityRouter from a checkpoint.
 
-    Nếu checkpoint không tồn tại -> trả về model với random weights
-    kèm warning (dev mode - service vẫn start được), và đánh dấu
-    `degraded=True` để mọi response từ run_routing() mang theo flag này.
+    If the checkpoint doesn't exist -> returns a model with random weights
+    plus a warning (dev mode - the service can still start), and sets
+    `degraded=True` so every response from run_routing() carries this flag.
 
     Returns:
-        model:     ModalityRouter ở eval mode
+        model:     ModalityRouter in eval mode
         transform: torchvision transform
         device:    str
-        degraded:  bool - True nếu đang chạy random weights
+        degraded:  bool - True if running with random weights
     """
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -196,8 +196,8 @@ def load_router(
         print(f"[router] Loaded checkpoint: {checkpoint_path}")
     else:
         print(
-            f"[router] WARNING: checkpoint không tìm thấy tại {checkpoint_path}. "
-            "Chạy với random weights - chỉ dùng cho dev/testing."
+            f"[router] WARNING: checkpoint not found at {checkpoint_path}. "
+            "Running with random weights - for dev/testing only."
         )
 
     model.eval()
@@ -205,7 +205,7 @@ def load_router(
     return model, transform, device, degraded
 
 
-# Chay inference
+# Run inference
 
 def run_routing(
     model: ModalityRouter,
@@ -220,30 +220,33 @@ def run_routing(
     Classify image bytes -> RoutingResult fields.
 
     OOD logic:
-        Nếu max(softmax) < ood_threshold -> is_ood=True, module_key='ood'
-        Orchestrator sẽ reject request trước khi gửi sang Vision service.
-        Hint không áp dụng khi is_ood=True - ảnh không thuộc class nào model
-        biết, hint không có cơ sở để override.
+        If max(softmax) < ood_threshold -> is_ood=True, module_key='ood'.
+        The orchestrator rejects the request before forwarding it to the
+        Vision service. The hint does not apply when is_ood=True -- the
+        image doesn't belong to any class the model knows, so the hint has
+        no basis to override.
 
-    `hint_module_key`: 'us_breast' | 'us_thyroid' | None, đã validate ở main.py.
-    Nếu có, kết hợp với router_probs qua resolve_with_hint() để ra module_key
-    cuối cùng, kèm hint_conflict/hint_resolution_note/final_decision_source.
+    `hint_module_key`: 'us_breast' | 'us_thyroid' | None, already validated
+    in main.py. If present, combined with router_probs via
+    resolve_with_hint() to produce the final module_key, along with
+    hint_conflict/hint_resolution_note/final_decision_source.
 
-    `degraded=True` duoc gan vao moi response khi router chay voi random weights.
+    `degraded=True` is attached to every response when the router runs with
+    random weights.
 
-    Tra ve dict map 1-1 vao RoutingResult schema.
+    Returns a dict that maps 1-1 into the RoutingResult schema.
     """
     if degraded:
         print(
-            "[router] WARNING: serving request với random weights - "
-            "routing decision không có ý nghĩa thống kê."
+            "[router] WARNING: serving request with random weights - "
+            "the routing decision has no statistical meaning."
         )
 
     # Decode bytes -> PIL
     img_array = np.frombuffer(image_bytes, dtype=np.uint8)
     img_bgr = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
     if img_bgr is None:
-        raise ValueError("Không decode được ảnh. Kiểm tra format (PNG/JPG).")
+        raise ValueError("Failed to decode image. Check the format (PNG/JPG).")
     check_image_dimensions(width=img_bgr.shape[1], height=img_bgr.shape[0])
     img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
     pil_img = Image.fromarray(img_rgb)

@@ -1,6 +1,5 @@
 """
 services/orchestrator/module_registry.py
-==========================================
 Reads and validates module_registry.yaml at orchestrator startup.
 
 Public API:

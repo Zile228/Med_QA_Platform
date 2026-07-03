@@ -140,10 +140,11 @@ class Tier1Structured(BaseModel):
 class RagSource(BaseModel):
     file: str = Field(...)
     page: int = Field(...)
-    # Optional vi UI khong can hien thi noi dung chunk, chi can citation
-    # (file, page). eval/eval_ragas.py va eval/eval_qa.py dung field nay de
-    # danh gia Faithfulness/Consistency tren noi dung RAG thuc te, vi
-    # _rag_chunks_internal trong graph.py khong duoc serialize ra HTTP response.
+    # Optional since the UI doesn't need to display chunk content, only the
+    # citation (file, page). eval/eval_ragas.py and eval/eval_qa.py use this
+    # field to evaluate Faithfulness/Consistency against the real RAG
+    # content, since _rag_chunks_internal in graph.py is not serialized
+    # into the HTTP response.
     text: Optional[str] = Field(default=None)
 
 

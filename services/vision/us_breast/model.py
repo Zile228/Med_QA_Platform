@@ -1,6 +1,5 @@
 """
 services/vision/us_breast/model.py
-====================================
 Checkpoint loading + inference wrapper for UNet_MTL (breast).
 
 Public API:

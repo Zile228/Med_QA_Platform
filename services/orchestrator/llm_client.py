@@ -1,6 +1,5 @@
 """
 services/orchestrator/llm_client.py
-=====================================
 LLM client -- supports 6 backends: Ollama (local), Google Gemini (cloud),
 OpenAI (cloud), RemoteInferenceClient (fine-tuned model on a rented pod),
 LocalHFClient (fine-tuned model running locally, eval only), and Mock (dev/test).

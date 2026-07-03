@@ -1,6 +1,5 @@
 """
 services/knowledge/mapper.py
-==============================
 Layer 3 - Knowledge Mapper.
 
 Takes ModelOutput + RoutingResult -> returns KnowledgeMapped + SpatialDerived.

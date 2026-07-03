@@ -1,6 +1,5 @@
 """
 services/vision/us_thyroid/model.py
-======================================
 Checkpoint loading + inference wrapper for UNet_MTL (thyroid).
 
 Public API:

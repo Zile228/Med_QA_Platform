@@ -1,6 +1,5 @@
 """
 services/vision/main.py
-=========================
 FastAPI Vision Service - Layer 2 | port 8002
 
 Endpoints:

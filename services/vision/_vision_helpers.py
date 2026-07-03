@@ -1,6 +1,5 @@
 """
 services/vision/_vision_helpers.py
-====================================
 Shared bottleneck enrichment, Grad-CAM, texture, and uncertainty helpers
 used by both us_breast/model.py and us_thyroid/model.py.
 

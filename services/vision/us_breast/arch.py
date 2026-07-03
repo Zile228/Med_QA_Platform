@@ -1,6 +1,5 @@
 """
 services/vision/us_breast/arch.py
-==================================
 Model architecture classes - copied from busi-architecture-full-implementation.ipynb.
 
 Only keeps what is needed for the POC (checkpoint mtl_effnet_fc_conv.pt):

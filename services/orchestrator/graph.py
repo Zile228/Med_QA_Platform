@@ -1,6 +1,6 @@
 """
 services/orchestrator/graph.py
-================================
+
 LangGraph pipeline - orchestrates the entire flow.
 
 Graph topology:
@@ -963,7 +963,7 @@ def make_consistency_guard_node(rag_store, rag_mode: str = "two_stage"):
                     not state["label_agreement"]  # label disagrees...
                     and (
                         abs(mapper_level - cot_level) > 1  # ...AND severity diverges
-                        or (cot_label in ("malignant",) and cnn_label in ("benign", "normal"))  # ...OR benign↔malignant flip
+                        or (cot_label in ("malignant",) and cnn_label in ("benign", "normal"))  # ...OR benign/malignant flip
                     )
                 )
 

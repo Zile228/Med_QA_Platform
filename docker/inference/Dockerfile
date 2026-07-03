@@ -1,24 +1,27 @@
-# Dockerfile mong, ke thua tu image chinh thuc vllm/vllm-openai -- image nay
-# da co san CUDA, vLLM, va entrypoint goc ["vllm", "serve"]. Khong tu viet
-# server rieng (transformers.pipeline khong ho tro continuous batching, se bi
-# nghen khi co nhieu request cung luc trong buoi demo).
+# Thin Dockerfile, inheriting from the official vllm/vllm-openai image --
+# this image already has CUDA, vLLM, and the original entrypoint
+# ["vllm", "serve"]. Does not write its own server (transformers.pipeline
+# does not support continuous batching and would bottleneck under multiple
+# concurrent requests during a demo).
 #
-# HF_MODEL_REPO duoc dien vao luc "docker run" qua bien moi truong, KHONG
-# nhung weight vao image -- vLLM tu tai model tu HuggingFace Hub luc khoi
-# dong va cache vao $HF_HOME (xem README deploy).
+# HF_MODEL_REPO is filled in at "docker run" time via an environment
+# variable, NOT baked into the image as weights -- vLLM downloads the model
+# from the HuggingFace Hub itself at startup and caches it in $HF_HOME (see
+# the deploy README).
 #
-# QUAN TRONG: dung ENTRYPOINT dang shell form (khong phai JSON array) de
-# $HF_MODEL_REPO duoc shell expand luc container start. Dang JSON array
-# (CMD ["vllm", "serve", "${HF_MODEL_REPO}"]) se KHONG expand bien moi
-# truong -- vllm se nhan nguyen chuoi literal "${HF_MODEL_REPO}" va loi.
+# IMPORTANT: uses shell-form ENTRYPOINT (not a JSON array) so that
+# $HF_MODEL_REPO gets shell-expanded at container start. The JSON array form
+# (CMD ["vllm", "serve", "${HF_MODEL_REPO}"]) would NOT expand the
+# environment variable -- vllm would receive the literal string
+# "${HF_MODEL_REPO}" and fail.
 FROM vllm/vllm-openai:latest
 
 ENV HF_MODEL_REPO=""
 ENV HF_TOKEN=""
-# VLLM_API_KEY duoc vLLM tu doc tu environment (khong can truyen --api-key
-# qua CLI). De rong = khong yeu cau auth; set gia tri = bat bearer-token auth
-# tren tat ca endpoint /v1/... -- RemoteInferenceClient phai dung dung token
-# nay qua REMOTE_INFERENCE_TOKEN trong .env cua orchestrator.
+# VLLM_API_KEY is read directly by vLLM from the environment (no need to
+# pass --api-key via CLI). Empty = no auth required; set a value = enables
+# bearer-token auth on every /v1/... endpoint -- RemoteInferenceClient must
+# use this exact token via REMOTE_INFERENCE_TOKEN in the orchestrator's .env.
 ENV VLLM_API_KEY=""
 
 EXPOSE 8000

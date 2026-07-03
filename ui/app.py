@@ -1,6 +1,5 @@
 """
 ui/app.py
-==========
 Gradio UI - demo interface for Med-Platform.
 
 2-column x 2-row layout:
