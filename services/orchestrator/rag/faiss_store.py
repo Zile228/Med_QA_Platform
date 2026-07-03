@@ -1,14 +1,18 @@
 """
 services/orchestrator/rag/faiss_store.py
-==========================================
 FAISS-based RAG retrieval for clinical documents.
 
 Workflow:
   1. Build (offline):   scripts/build_vectordb.py runs once, indexes PDFs -> disk
   2. Retrieve (online): FAISSStore.retrieve(...) -> List[str]
 
-Metadata (source_file, page_number, organ) is loaded from metadata.pkl if present.
-An old index (without metadata.pkl) still works -- falls back to returning plain chunk text.
+Metadata (source_file, page_number, page_end, section_heading, organ) is
+loaded from metadata.pkl if present. An index without metadata.pkl still
+works, falling back to a "general" placeholder for every chunk.
+
+organ_filter only matches "breast" or "thyroid" exactly; any other value
+(including "chest", "unknown", or "general" itself) returns no results
+instead of silently falling back -- see _filter_by_organ() for the reasoning.
 
 Public API:
     FAISSStore(index_path, docs_path)
@@ -34,8 +38,8 @@ class FAISSStore:
         self,
         index_path: str = None,
         chunks_path: str = None,
-        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        cross_encoder_model: str = "cross-encoder/ms-marco-MiniLM-L-6-v2",
+        embedding_model: str = "models/checkpoints/embedding_model_finetuned_final",
+        cross_encoder_model: str = "models/checkpoints/reranker_finetuned_final",
     ):
         self.index_path = index_path or os.getenv(
             "FAISS_INDEX_PATH",
@@ -128,8 +132,17 @@ class FAISSStore:
 
     def _filter_by_organ(self, indices, distances, organ_filter: Optional[str]):
         """
-        Keeps chunks whose metadata.organ matches organ_filter or is "general".
+        Keeps chunks whose metadata.organ matches organ_filter exactly.
         If organ_filter is None, returns everything (no filtering).
+
+        After build_vectordb.py's allow-list (see ALLOWED_PDF_FILENAMES),
+        every indexed chunk is tagged organ="breast" or organ="thyroid";
+        the "general" placeholder is no longer expected to have real
+        clinical content behind it. organ_filter values outside
+        {"breast", "thyroid"} (e.g. "chest", "unknown") therefore return
+        no results instead of silently falling back to "general" -- a
+        caller should treat that as "no clinical guideline coverage for
+        this organ" rather than receive unrelated chunks.
         """
         if organ_filter is None:
             return [
@@ -138,6 +151,9 @@ class FAISSStore:
                 if 0 <= idx < len(self._chunks)
             ]
 
+        if organ_filter not in ("breast", "thyroid"):
+            return []
+
         result = []
         for idx, dist in zip(indices, distances):
             idx = int(idx)
@@ -145,7 +161,7 @@ class FAISSStore:
                 continue
             meta = self._metadata[idx] if idx < len(self._metadata) else {}
             chunk_organ = meta.get("organ", "general")
-            if chunk_organ in (organ_filter, "general"):
+            if chunk_organ == organ_filter:
                 result.append((idx, float(dist)))
         return result
 
@@ -179,7 +195,9 @@ class FAISSStore:
         Retrieve the top-k chunks with full metadata.
 
         Returns a list of dicts:
-            {"chunk": str, "source_file": str, "page_number": int, "organ": str}
+            {"chunk": str, "source_file": str, "page_number": int,
+             "page_end": int, "section_heading": str | None,
+             "organ": str, "score": float}
         """
         if not self.is_ready():
             return []
@@ -200,12 +218,15 @@ class FAISSStore:
                     continue
                 seen_texts.add(text)
                 meta = self._metadata[idx] if idx < len(self._metadata) else {}
+                page_number = meta.get("page_number", 0)
                 results.append({
-                    "chunk":       text,
-                    "source_file": meta.get("source_file", "unknown"),
-                    "page_number": meta.get("page_number", 0),
-                    "organ":       meta.get("organ", "general"),
-                    "score":       round(dist, 4),
+                    "chunk":           text,
+                    "source_file":     meta.get("source_file", "unknown"),
+                    "page_number":     page_number,
+                    "page_end":        meta.get("page_end", page_number),
+                    "section_heading": meta.get("section_heading"),
+                    "organ":           meta.get("organ", "general"),
+                    "score":           round(dist, 4),
                 })
                 if len(results) >= k:
                     break

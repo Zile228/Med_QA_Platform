@@ -1,6 +1,5 @@
 """
 services/vision/main.py
-=========================
 FastAPI Vision Service - Layer 2 | port 8002
 
 Endpoints:
@@ -142,7 +141,7 @@ async def analyze_us_breast(
 ):
     """
     Inference pipeline for Breast Ultrasound (BUSI dataset).
-    Returns a ModelOutput with bottleneck_features for the orchestrator to use in the LLM prompt.
+    Returns a ModelOutput with enriched features for the orchestrator to use in the LLM prompt.
     """
     if _breast_model is None:
         raise HTTPException(
@@ -187,8 +186,13 @@ async def analyze_us_breast(
         confidence=result["confidence"],
         all_scores=result["all_scores"],
         mask_png_base64=result["mask_png_base64"],
-        bottleneck_features=result["bottleneck_features"],
         original_size=list(result["original_size"]),
+        bottleneck_enriched=result.get("bottleneck_enriched", {}),
+        gradcam_png_base64=result.get("gradcam_png_base64", ""),
+        gradcam_mask_overlap=result.get("gradcam_mask_overlap", {}),
+        texture_features=result.get("texture_features", {}),
+        uncertainty=result.get("uncertainty", {}),
+        filtered_findings=result.get("filtered_findings", []),
     )
 
 
@@ -248,8 +252,13 @@ async def analyze_us_thyroid(
         confidence=result["confidence"],
         all_scores=result["all_scores"],
         mask_png_base64=result["mask_png_base64"],
-        bottleneck_features=result["bottleneck_features"],
         original_size=list(result["original_size"]),
+        bottleneck_enriched=result.get("bottleneck_enriched", {}),
+        gradcam_png_base64=result.get("gradcam_png_base64", ""),
+        gradcam_mask_overlap=result.get("gradcam_mask_overlap", {}),
+        texture_features=result.get("texture_features", {}),
+        uncertainty=result.get("uncertainty", {}),
+        filtered_findings=result.get("filtered_findings", []),
     )
 
 

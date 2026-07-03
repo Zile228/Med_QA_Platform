@@ -1,6 +1,5 @@
 """
 services/vision/us_thyroid/arch.py
-====================================
 Model architecture for Thyroid Ultrasound (TN3K dataset).
 
 Identical to us_breast/arch.py, only changes:

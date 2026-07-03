@@ -1,6 +1,5 @@
 """
 services/orchestrator/main.py
-==============================
 FastAPI Orchestrator -- Layer 4 Gateway | port 8000
 
 Endpoints:
@@ -75,6 +74,11 @@ try:
         "Distribution of confidence scores from the vision model",
         buckets=[0.5, 0.6, 0.7, 0.8, 0.9, 0.95, 0.99, 0.999, 1.0],
     )
+    _cot_parse_failure_counter = Counter(
+        "orchestrator_cot_parse_failure_total",
+        "Number of requests where CoT JSON parsing failed (severity=undetermined). "
+        "High values indicate the LLM is not following the required output schema.",
+    )
 except ImportError:
     PROM_AVAILABLE = False
 
@@ -98,21 +102,22 @@ _context_cache: dict = {}
 
 _graph       = None
 _llm_client  = None
+_rag_store   = None
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _graph, _llm_client
+    global _graph, _llm_client, _rag_store
     setup_tracing("orchestrator", app=app)
     print("[orchestrator] Initializing pipeline...")
 
     _llm_client = get_llm_client()
-    rag_store   = FAISSStore(index_path=FAISS_INDEX_PATH)
+    _rag_store  = FAISSStore(index_path=FAISS_INDEX_PATH)
 
-    if not rag_store.is_ready():
+    if not _rag_store.is_ready():
         print("[orchestrator] RAG index not ready -- LLM will run without clinical context.")
 
-    _graph = build_graph(SERVICES_CFG, _llm_client, rag_store, registry=_registry)
+    _graph = build_graph(SERVICES_CFG, _llm_client, _rag_store, registry=_registry)
     print(f"[orchestrator] Graph ready -- services: {SERVICES_CFG}")
     print(
         f"[orchestrator] Vision modalities: "
@@ -152,12 +157,14 @@ class ChatResponse(BaseModel):
 
 def _save_context(image_id: str, report_dict: dict, rag_chunks: list):
     """Save context into the cache after /analyze succeeds."""
+    organ = report_dict.get("tier_1_structured", {}).get("organ")
     _context_cache[image_id] = {
         "context": {
             "image_id": image_id,
             "report":   report_dict,
         },
         "rag_chunks": rag_chunks,
+        "organ": organ,
         "ts": time.time(),
     }
 
@@ -215,13 +222,17 @@ def metrics():
 @app.post("/analyze", response_model=ReportOutput)
 async def analyze(
     image: UploadFile = File(..., description="Ultrasound image PNG/JPG"),
-    question: str = Form(
-        default="What are the findings in this ultrasound image?",
-        description="Clinical question",
-    ),
     image_id: str = Form(default=None, description="Optional custom image ID"),
     modality_hint: Optional[str] = Form(default=None, description="'breast' | 'thyroid' | None"),
     organ_hint: Optional[str] = Form(default=None, description="'breast' | 'thyroid' | None"),
+    pixel_spacing_mm: Optional[float] = Form(
+        default=None,
+        description="Real-world mm per pixel, typically from DICOM metadata. None when unknown.",
+    ),
+    laterality: Optional[str] = Form(
+        default=None,
+        description="'left' | 'right' | None. Resolves breast outer/inner labeling.",
+    ),
 ):
     """
     Main entry point for the client / Gradio UI.
@@ -230,6 +241,10 @@ async def analyze(
     combines them with router_probs by weight to reach the final decision.
     Hint conflicts are recorded in Tier1Structured.hint_conflict and
     hint_resolution_note.
+
+    pixel_spacing_mm and laterality are forwarded to the spatial node.
+    Without them, area_cm2 stays None and breast outer/inner stays
+    unresolved, exactly as when omitted today.
     """
     if _graph is None:
         raise HTTPException(status_code=503, detail="Orchestrator not ready.")
@@ -250,10 +265,11 @@ async def analyze(
             report_dict = await run_pipeline_async(
                 graph=_graph,
                 image_bytes=image_bytes,
-                question=question,
                 image_id=image_id,
                 modality_hint=modality_hint,
                 organ_hint=organ_hint,
+                pixel_spacing_mm=pixel_spacing_mm,
+                laterality=laterality,
             )
             t1_data = report_dict.get("tier_1_structured", {})
             span.set_attribute("result.organ",      t1_data.get("organ", ""))
@@ -298,14 +314,20 @@ async def analyze(
 
     t1 = report_dict["tier_1_structured"]
 
-    # Convert rag_sources from a list of dicts to a list of RagSource
+    # Convert rag_sources from a list of dicts to a list of RagSource.
+    # rag_chunks (chunk text) and raw_sources (file/page) are built from
+    # the same reranked list in graph.py (see rag_chunks = [m["chunk"] for m
+    # in reranked]), so they have the same length and order -- safe to zip by index.
     raw_sources = report_dict.get("rag_sources", [])
+    rag_chunks_internal = report_dict.get("_rag_chunks_internal", [])
     rag_sources = []
-    for src in raw_sources:
+    for i, src in enumerate(raw_sources):
         if isinstance(src, dict):
+            chunk_text = rag_chunks_internal[i] if i < len(rag_chunks_internal) else None
             rag_sources.append(RagSource(
                 file=src.get("file", "unknown"),
                 page=src.get("page", 0),
+                text=chunk_text,
             ))
 
     # Convert cot_result from dict to CoTResult if present
@@ -316,6 +338,9 @@ async def analyze(
             cot_result = CoTResult(**cot_raw)
         except Exception:
             cot_result = None
+    elif cot_raw and isinstance(cot_raw, dict) and cot_raw.get("severity") == "undetermined":
+        if PROM_AVAILABLE:
+            _cot_parse_failure_counter.inc()
 
     try:
         tier1_obj = Tier1Structured(**t1)
@@ -337,6 +362,7 @@ async def analyze(
         cot_result=cot_result,
         consensus=report_dict.get("consensus"),
         icd10_agreement=report_dict.get("icd10_agreement"),
+        hard_conflict=report_dict.get("hard_conflict"),
     )
 
 
@@ -346,15 +372,34 @@ async def chat(req: ChatRequest):
     Multi-turn chatbot built on already-analyzed context.
 
     Does not take the image again -- reuses context from _context_cache by
-    image_id. Vision/router/knowledge are NOT called again -- only the LLM
-    is called with context + history.
+    image_id. Vision/router/knowledge are NOT called again -- only RAG is
+    re-queried with the follow-up question text, then the LLM is called
+    with context + history.
+
+    rag_chunks saved at /analyze time stay relevant to the original finding,
+    so they are kept as background context. Chunks retrieved for this
+    specific follow-up question are placed first, since they are most
+    likely to answer what the user is actually asking now.
     """
     if _llm_client is None:
         raise HTTPException(status_code=503, detail="LLM client not ready.")
 
     entry = _get_context(req.image_id)
     unified_context = entry["context"]
-    rag_chunks      = entry["rag_chunks"]
+    saved_rag_chunks = entry["rag_chunks"]
+    organ = entry.get("organ")
+
+    rag_chunks = saved_rag_chunks
+    if _rag_store and _rag_store.is_ready():
+        try:
+            follow_up_meta = await asyncio.to_thread(
+                _rag_store.retrieve_with_meta, req.message, 3, organ
+            )
+            follow_up_chunks = [m["chunk"] for m in follow_up_meta]
+            seen = set(follow_up_chunks)
+            rag_chunks = follow_up_chunks + [c for c in saved_rag_chunks if c not in seen]
+        except Exception as e:
+            logger.exception("Chat follow-up RAG retrieve failed -- falling back to saved context")
 
     history_dicts = [{"role": m.role, "content": m.content} for m in req.history]
 

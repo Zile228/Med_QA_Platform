@@ -1,29 +1,12 @@
-"""
-services/vision/us_breast/postprocess.py
-==========================================
-Mask (numpy array / base64 PNG) -> SpatialDerived fields.
-
-Public API:
-    extract_spatial_features(mask, pixel_spacing_mm) -> dict
-    get_location_quadrant(centroid, image_size, organ) -> tuple[str, str]
-    postprocess_mask(mask_png_base64, original_size, organ, pixel_spacing_mm) -> dict
-
-Called by knowledge/mapper.py - receives the mask as a base64 PNG over the
-HTTP body, does NOT read from a path on disk (vision and knowledge are 2
-separate containers that do not share a filesystem - see ISSUES_AND_FIXES.md item 1).
-"""
-
 import base64
 import cv2
 import numpy as np
-from typing import Tuple
+from typing import Optional, Tuple
 
-
-# Computing spatial features from the mask
 
 def extract_spatial_features(
     mask: np.ndarray,
-    pixel_spacing_mm: float = 0.1,
+    pixel_spacing_mm: Optional[float] = None,
 ) -> dict:
     """
     Computes spatial features from a binary mask.
@@ -31,13 +14,7 @@ def extract_spatial_features(
     Args:
         mask:             binary mask (H, W), values 0 or 255
         pixel_spacing_mm: real-world distance per pixel (mm).
-                          0.1mm/px is the default value for the BUSI dataset.
-                          1 cm2 = 100 mm2 -> area_px * spacing^2 / 100
-
-    Returns a dict with:
-        bbox, area_cm2, centroid, width_px, height_px,
-        aspect_ratio, circularity
-    Returns an empty dict if no contour is found (normal image/no lesion).
+                          None means no DICOM metadata available; area_cm2 will be None.
     """
     mask_uint8 = mask.astype(np.uint8)
     if mask_uint8.max() > 1:
@@ -50,12 +27,16 @@ def extract_spatial_features(
     if not contours:
         return {}
 
-    # Take the largest contour, ignore noise
     largest = max(contours, key=cv2.contourArea)
-
     x, y, w, h = cv2.boundingRect(largest)
     area_px = cv2.contourArea(largest)
-    area_cm2 = round(area_px * (pixel_spacing_mm ** 2) / 100, 3)
+
+    if pixel_spacing_mm is not None:
+        area_cm2 = round(area_px * (pixel_spacing_mm ** 2) / 100, 3)
+        pixel_spacing_reliable = True
+    else:
+        area_cm2 = None
+        pixel_spacing_reliable = False
 
     M = cv2.moments(largest)
     if M["m00"] > 0:
@@ -64,7 +45,6 @@ def extract_spatial_features(
     else:
         cx, cy = x + w // 2, y + h // 2
 
-    # Compute shape descriptors
     aspect_ratio = round(w / h, 3) if h > 0 else 1.0
     perimeter = cv2.arcLength(largest, True)
     circularity = (
@@ -72,51 +52,50 @@ def extract_spatial_features(
         if perimeter > 0 else 0.0
     )
 
+    if aspect_ratio < 0.8:
+        aspect_ratio_interpretation = "taller-than-wide (suspicious per BI-RADS)"
+    elif aspect_ratio > 1.8:
+        aspect_ratio_interpretation = "markedly wider-than-tall (low suspicion)"
+    else:
+        aspect_ratio_interpretation = "intermediate"
+
     return {
         "bbox": [x, y, x + w, y + h],
         "area_cm2": area_cm2,
+        "pixel_spacing_reliable": pixel_spacing_reliable,
         "centroid": [cx, cy],
         "width_px": w,
         "height_px": h,
-        "aspect_ratio": aspect_ratio,   # > 1.5 -> elongated (suspicious)
-        "circularity": circularity,     # < 0.5 -> irregular margin (suspicious)
+        "aspect_ratio": aspect_ratio,
+        "aspect_ratio_interpretation": aspect_ratio_interpretation,
+        "circularity": circularity,
     }
 
-
-# Determining the lesion's quadrant
 
 def get_location_quadrant(
     centroid: list,
     image_size: Tuple[int, int],
     organ: str = "breast",
+    laterality: Optional[str] = None,
 ) -> Tuple[str, str]:
     """
     Determines the lesion's quadrant from the centroid and image size.
 
-    Args:
-        centroid:   [cx, cy] pixel coordinates
-        image_size: (H, W) of the original image
-        organ:      'breast' | 'thyroid'
+    Breast: upper-outer | upper-inner | lower-outer | lower-inner | central
+    Thyroid: left-lobe | right-lobe | isthmus
 
-    Returns:
-        (quadrant_str, confidence_str)
-
-    Breast quadrants (following clinical convention):
-        Upper-outer | Upper-inner | Lower-outer | Lower-inner | Central
-        Axis: x < W/2 -> outer (if right breast, needs flipping - POC assumes right breast)
-              y < H/2 -> upper
-
-    Thyroid:
-        Left-lobe | Right-lobe | Isthmus
-        Axis: x < W*0.35 -> left-lobe, x > W*0.65 -> right-lobe, else isthmus
+    For breast, image-left vs image-right alone does not determine
+    outer/inner; it depends on which breast was imaged. With laterality
+    'right', image-left is medial (inner) and image-right is lateral
+    (outer); with laterality 'left' it is reversed. When laterality is
+    None, the side cannot be determined and is reported as such.
     """
     H, W = image_size
     cx, cy = centroid
 
-    # Confidence based on the distance from the centroid to the image edge
     dist_to_edge = min(cx, W - cx, cy, H - cy)
     if dist_to_edge < 0.1 * min(H, W):
-        confidence = "low"    # centroid near the edge -> quadrant is uncertain
+        confidence = "low"
     elif dist_to_edge < 0.2 * min(H, W):
         confidence = "medium"
     else:
@@ -124,13 +103,15 @@ def get_location_quadrant(
 
     if organ == "breast":
         mid_x, mid_y = W / 2, H / 2
-        # Margin zone around the midline -> central
         if abs(cx - mid_x) < W * 0.1 and abs(cy - mid_y) < H * 0.1:
             return "central", confidence
-
-        vertical   = "upper" if cy < mid_y else "lower"
-        horizontal = "outer" if cx < mid_x else "inner"
-        # Assumes right breast: outer = left side of the image
+        vertical = "upper" if cy < mid_y else "lower"
+        if laterality == "right":
+            horizontal = "outer" if cx < mid_x else "inner"
+        elif laterality == "left":
+            horizontal = "inner" if cx < mid_x else "outer"
+        else:
+            horizontal = "outer-or-inner"
         return f"{vertical}-{horizontal}", confidence
 
     elif organ == "thyroid":
@@ -145,31 +126,18 @@ def get_location_quadrant(
         return "unknown", "low"
 
 
-# Main postprocess function
-
 def postprocess_mask(
     mask_png_base64: str,
     original_size: Tuple[int, int],
     organ: str = "breast",
-    pixel_spacing_mm: float = 0.1,
+    pixel_spacing_mm: Optional[float] = None,
+    laterality: Optional[str] = None,
 ) -> dict:
     """
     Decodes the mask from a base64 PNG -> returns all SpatialDerived fields.
 
-    Args:
-        mask_png_base64:  mask PNG base64-encoded (received directly over the
-                           HTTP body, does NOT read from a path on disk - vision
-                           and knowledge are 2 separate containers that don't
-                           share a filesystem)
-        original_size:    (H, W) of the original image
-        organ:            'breast' | 'thyroid'
-        pixel_spacing_mm: mm/pixel
-
-    Returns a dict mapping 1-1 into the SpatialDerived schema.
-
     Raises:
         ValueError: if the base64 cannot be decoded, or the bytes are not a valid PNG.
-                    Fails loudly, no silent fallback, to avoid fabricated data.
     """
     if not mask_png_base64:
         raise ValueError(
@@ -193,22 +161,23 @@ def postprocess_mask(
     spatial = extract_spatial_features(mask, pixel_spacing_mm)
 
     if not spatial:
-        # Valid case: mask is OK but has no contour (normal image/no lesion)
         return _empty_spatial(original_size)
 
     quadrant, loc_confidence = get_location_quadrant(
-        spatial["centroid"], original_size, organ
+        spatial["centroid"], original_size, organ, laterality
     )
 
     return {
-        "bbox":               spatial["bbox"],
-        "area_cm2":           spatial["area_cm2"],
-        "centroid":           spatial["centroid"],
-        "location_quadrant":  quadrant,
-        "aspect_ratio":       spatial["aspect_ratio"],
-        "circularity":        spatial["circularity"],
-        "width_px":           spatial["width_px"],
-        "height_px":          spatial["height_px"],
+        "bbox": spatial["bbox"],
+        "area_cm2": spatial["area_cm2"],
+        "pixel_spacing_reliable": spatial["pixel_spacing_reliable"],
+        "centroid": spatial["centroid"],
+        "location_quadrant": quadrant,
+        "aspect_ratio": spatial["aspect_ratio"],
+        "aspect_ratio_interpretation": spatial["aspect_ratio_interpretation"],
+        "circularity": spatial["circularity"],
+        "width_px": spatial["width_px"],
+        "height_px": spatial["height_px"],
         "location_confidence": loc_confidence,
     }
 
@@ -217,13 +186,15 @@ def _empty_spatial(image_size: Tuple[int, int]) -> dict:
     """Fallback for when no lesion is detected (normal image)."""
     H, W = image_size
     return {
-        "bbox":                [0, 0, 0, 0],
-        "area_cm2":            0.0,
-        "centroid":            [W // 2, H // 2],
-        "location_quadrant":   "none",
-        "aspect_ratio":        1.0,
-        "circularity":         1.0,
-        "width_px":            0,
-        "height_px":           0,
+        "bbox": [0, 0, 0, 0],
+        "area_cm2": None,
+        "pixel_spacing_reliable": False,
+        "centroid": [W // 2, H // 2],
+        "location_quadrant": "none",
+        "aspect_ratio": 1.0,
+        "aspect_ratio_interpretation": "",
+        "circularity": 1.0,
+        "width_px": 0,
+        "height_px": 0,
         "location_confidence": "low",
     }

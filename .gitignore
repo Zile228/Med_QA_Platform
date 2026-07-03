@@ -1,9 +1,6 @@
-# --- Bảo mật & Môi trường ---
 .env
 .env.*
 !.env.example
-
-# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
@@ -11,29 +8,20 @@ __pycache__/
 .venv/
 venv/
 ENV/
-
-# --- Trọng số mô hình (Model Weights) ---
-# Bỏ qua toàn bộ file trọng số nặng trong thư mục checkpoints, chỉ giữ lại cấu trúc thư mục nhờ .gitkeep
 models/checkpoints/*
 !models/checkpoints/.gitkeep
-
-# --- Dữ liệu huấn luyện (Datasets) ---
-# Bỏ qua các thư mục dữ liệu lớn nếu có
 data/busi/*
 !data/busi/.gitkeep
 data/tn3k/*
 !data/tn3k/.gitkeep
-
-# --- Vector Database & RAG ---
-# Bỏ qua cơ sở dữ liệu vector được tạo ra khi chạy chương trình
+data/router/*
+!data/router/.gitkeep
+eval/
+scripts/finetune_data
 services/orchestrator/rag/vectordb/*
 !services/orchestrator/rag/vectordb/.gitkeep
-
-# (Tùy chọn) Bỏ qua các tài liệu PDF trong docs nếu bạn không muốn commit chúng lên Git:
 services/orchestrator/rag/docs/*
 !services/orchestrator/rag/docs/.gitkeep
-
-# --- Hệ điều hành & Công cụ phát triển ---
 .DS_Store
 Thumbs.db
 .vscode/

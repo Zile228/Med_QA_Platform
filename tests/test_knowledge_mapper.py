@@ -32,8 +32,9 @@ def test_derive_spatial_uses_breast_postprocess_for_breast_organ(monkeypatch):
 
     def fake_breast(**kwargs):
         called["breast"] = True
-        return {"bbox": [0, 0, 1, 1], "area_cm2": 0.0, "centroid": [0, 0],
-                "location_quadrant": "central", "aspect_ratio": 1.0,
+        return {"bbox": [0, 0, 1, 1], "area_cm2": None, "pixel_spacing_reliable": False,
+                "centroid": [0, 0], "location_quadrant": "central", "aspect_ratio": 1.0,
+                "aspect_ratio_interpretation": "intermediate",
                 "circularity": 1.0, "width_px": 1, "height_px": 1,
                 "location_confidence": "high"}
 
@@ -63,8 +64,9 @@ def test_derive_spatial_uses_thyroid_postprocess_for_thyroid_organ(monkeypatch):
 
     def fake_thyroid(**kwargs):
         called["thyroid"] = True
-        return {"bbox": [0, 0, 1, 1], "area_cm2": 0.0, "centroid": [0, 0],
-                "location_quadrant": "left-lobe", "aspect_ratio": 1.0,
+        return {"bbox": [0, 0, 1, 1], "area_cm2": None, "pixel_spacing_reliable": False,
+                "centroid": [0, 0], "location_quadrant": "left-lobe", "aspect_ratio": 1.0,
+                "aspect_ratio_interpretation": "intermediate",
                 "circularity": 1.0, "width_px": 1, "height_px": 1,
                 "location_confidence": "high"}
 

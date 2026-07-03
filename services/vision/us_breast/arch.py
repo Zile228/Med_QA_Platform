@@ -1,6 +1,5 @@
 """
 services/vision/us_breast/arch.py
-==================================
 Model architecture classes - copied from busi-architecture-full-implementation.ipynb.
 
 Only keeps what is needed for the POC (checkpoint mtl_effnet_fc_conv.pt):
@@ -85,7 +84,7 @@ class UNet_MTL(nn.Module):
       - seg_output:    (B, 1, H, W)   - sigmoid mask [0, 1]
       - cls_output:    (B, NUM_CLASSES) - raw logits (before softmax)
       - bottleneck_out: (B, 448, 7, 7) - feature map from the bottom of the
-                        encoder, used to extract bottleneck_features for the LLM
+                        encoder, used to extract bottleneck_enriched features for the visual interpreter
 
     EfficientNet-B4 encoder channels: [24, 32, 56, 160, 448]
     """

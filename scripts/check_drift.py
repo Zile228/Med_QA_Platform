@@ -1,6 +1,5 @@
 """
 scripts/check_drift.py
-========================
 Manual data drift check script -- NOT a continuously running service.
 Run manually as needed, outputs HTML + JSON for manual review.
 

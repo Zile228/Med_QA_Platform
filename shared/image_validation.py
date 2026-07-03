@@ -1,6 +1,5 @@
 """
 shared/image_validation.py
-============================
 Shared upload validation used by every service that accepts an image
 (router, vision, orchestrator). Centralizes size and dimension limits
 so they can't drift out of sync between services.

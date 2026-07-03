@@ -103,6 +103,7 @@ services:
       - ./services/orchestrator/rag/docs:/app/services/orchestrator/rag/docs:ro
       - ./services/orchestrator/rag/vectordb:/app/services/orchestrator/rag/vectordb
       - ./module_registry.yaml:/app/module_registry.yaml:ro
+      - ./models/checkpoints:/app/models/checkpoints:ro
     depends_on:
       - router
       - vision
@@ -115,6 +116,7 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      start_period: 5m
 
   ui:
     build:

@@ -1,6 +1,6 @@
 """
 services/router/main.py
-========================
+
 FastAPI Router Service -- Layer 1 | port 8001
 
 Endpoints:
@@ -45,12 +45,12 @@ try:
     PROM_AVAILABLE = True
     _route_latency = Histogram(
         "router_route_duration_seconds",
-        "Latency cua /route endpoint",
+        "Latency of the /route endpoint",
         buckets=[0.05, 0.1, 0.25, 0.5, 1.0, 2.0],
     )
     _route_counter = Counter(
         "router_route_requests_total",
-        "Tong so request /route",
+        "Total number of /route requests",
         ["module_key", "is_ood", "status"],
     )
 except ImportError:
@@ -103,21 +103,21 @@ def health():
 @app.get("/metrics", response_class=PlainTextResponse)
 def metrics():
     if not PROM_AVAILABLE:
-        return PlainTextResponse("# prometheus_client chua install\n", status_code=200)
+        return PlainTextResponse("# prometheus_client not installed\n", status_code=200)
     return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @app.post("/route", response_model=RoutingResult)
 async def route_image(
-    image: UploadFile = File(..., description="Anh can classify modality"),
+    image: UploadFile = File(..., description="Image to classify the modality of"),
     modality_hint: Optional[str] = Form(default=None),
     organ_hint: Optional[str] = Form(default=None),
 ):
     """
-    Nhan anh + optional hint -> tra ve RoutingResult.
+    Takes an image + optional hint -> returns a RoutingResult.
 
-    organ_hint hop le: 'breast' | 'thyroid'. Tra 400 neu gia tri khac.
-    Hint bi bo qua hoan toan khi is_ood=True.
+    Valid organ_hint: 'breast' | 'thyroid'. Returns 400 for any other value.
+    The hint is completely ignored when is_ood=True.
     """
     if _model is None:
         raise HTTPException(status_code=503, detail="Router model not loaded.")

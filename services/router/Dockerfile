@@ -8,8 +8,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements/router.txt requirements.txt
-# Cài torch bản CPU-only (nhẹ hơn nhiều so với bản CUDA mặc định từ PyPI,
-# tránh lỗi tải hỏng/đứt giữa đường do file quá lớn)
+# Installs the CPU-only build of torch (much lighter than the default CUDA
+# build from PyPI, avoiding corrupted/interrupted downloads for large files)
 RUN pip install --no-cache-dir --index-url https://download.pytorch.org/whl/cpu torch torchvision
 RUN pip install --no-cache-dir -r requirements.txt
 
